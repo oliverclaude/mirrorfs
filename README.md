@@ -131,9 +131,13 @@ directory and append to the queue.
 ## Known limitations
 
 - One way only. Remote edits are not pulled back, and pre-existing differences
-  are not bulk-copied. A pre-existing local file is copied only when a
-  mutation through the mount touches it (or a parent directory must be created
-  to hold such a copy).
+  are not bulk-copied. A mutation of a path that mirrorfs has not already
+  created on the remote is retried until that path exists. The full local
+  snapshot that should create the missing object (content, mode, owner,
+  timestamps, and xattrs) is not queued yet.
+- A replayed create or write gets its timestamps when the remote call runs.
+  An explicit timestamp change is stored in the queue as the resulting value
+  and applied as that value.
 - The first mutation of a file the remote does not yet have reads the whole
   local file into the queue. That copy is buffered in memory while it is
   written to `.mirrorfs-queue/`.
@@ -153,7 +157,10 @@ directory and append to the queue.
 
 ## Status
 
-The checked items in `TODO.md` are what currently works. Mutations are applied
-to the local directory and appended to `.mirrorfs-queue/`. Those records stay
-on disk across unmount and restart. The remote directory is not updated yet;
-the next piece is the background worker that drains the queue.
+The checked items in `TODO.md` are what currently works. One background thread
+applies the oldest `.mirrorfs-queue/` record to the remote directory and
+deletes it only after that call succeeds. A remote error leaves the record in
+place and retries it, including after the process is killed. A mutation of a
+path mirrorfs has not already created on the remote stays at the head of the
+queue until that path exists. The next piece is the full local snapshot that
+should create it.

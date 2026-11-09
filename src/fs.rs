@@ -7,8 +7,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -23,15 +24,15 @@ use crate::util::{self, TTL};
 
 pub struct MirrorFs {
     local: PathBuf,
-    #[allow(dead_code)]
-    remote: PathBuf,
     debug: bool,
     inodes: Mutex<InodeTable>,
     files: Mutex<HashMap<u64, OpenFile>>,
     dirs: Mutex<HashMap<u64, OpenDir>>,
     next_fh: AtomicU64,
-    queue: Queue,
+    queue: Arc<Queue>,
     stripes: Vec<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
 
 struct OpenFile {
@@ -47,14 +48,15 @@ struct OpenDir {
 impl MirrorFs {
     pub fn new(local: PathBuf, remote: PathBuf, debug: bool) -> io::Result<Self> {
         let st = util::lstat(&local)?;
-        let queue = Queue::open(&local)?;
+        let queue = Arc::new(Queue::open(&local)?);
         let mut stripes = Vec::with_capacity(64);
         for _ in 0..64 {
             stripes.push(Mutex::new(()));
         }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = crate::worker::spawn(Arc::clone(&queue), remote, Arc::clone(&stop), debug)?;
         Ok(Self {
             local,
-            remote,
             debug,
             inodes: Mutex::new(InodeTable::new(st.st_ino)),
             files: Mutex::new(HashMap::new()),
@@ -62,6 +64,8 @@ impl MirrorFs {
             next_fh: AtomicU64::new(1),
             queue,
             stripes,
+            stop,
+            worker: Some(worker),
         })
     }
 
@@ -165,6 +169,15 @@ impl MirrorFs {
 }
 
 impl Filesystem for MirrorFs {
+    fn destroy(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("mirrorfs: remote worker panicked");
+            }
+        }
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         if name == "." {

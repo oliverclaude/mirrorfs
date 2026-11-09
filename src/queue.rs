@@ -218,6 +218,26 @@ impl Queue {
         }
         Ok(out)
     }
+
+    /// The oldest committed record, if the queue is not empty.
+    pub fn head(&self) -> io::Result<Option<(u64, Op)>> {
+        let Some(seq) = pending_seqs(&self.dir)?.into_iter().min() else {
+            return Ok(None);
+        };
+        let bytes = fs::read(self.dir.join(format!("{seq:020}.op")))?;
+        Ok(Some((seq, Op::decode(&bytes)?)))
+    }
+
+    /// Drop a record after the remote call has succeeded.
+    pub fn ack(&self, seq: u64) -> io::Result<()> {
+        let path = self.dir.join(format!("{seq:020}.op"));
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        fsync_dir(&self.dir)
+    }
 }
 
 fn pending_seqs(dir: &Path) -> io::Result<Vec<u64>> {
@@ -260,6 +280,24 @@ impl Op {
             | Op::Fsync { path, .. }
             | Op::Fallocate { path, .. } => path,
             Op::Copy(op) => &op.path,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Op::Create(_) => "create",
+            Op::Write(_) => "write",
+            Op::Setattr(_) => "setattr",
+            Op::Unlink(_) => "unlink",
+            Op::Rmdir(_) => "rmdir",
+            Op::Rename { .. } => "rename",
+            Op::Link { .. } => "link",
+            Op::Symlink { .. } => "symlink",
+            Op::Setxattr { .. } => "setxattr",
+            Op::Removexattr { .. } => "removexattr",
+            Op::Fsync { .. } => "fsync",
+            Op::Fallocate { .. } => "fallocate",
+            Op::Copy(_) => "copy",
         }
     }
 

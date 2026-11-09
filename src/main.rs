@@ -2,6 +2,7 @@ mod fs;
 mod inode;
 mod queue;
 mod util;
+mod worker;
 
 use std::io::{self, ErrorKind};
 use std::mem;
