@@ -1,0 +1,21 @@
+[package]
+name = "mirrorfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "FUSE filesystem that asynchronously mirrors local mutations to a remote directory"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "mirrorfs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fuser = "0.18"
+libc = "0.2"
+
+[profile.release]
+lto = false
+codegen-units = 16
