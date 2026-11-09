@@ -54,7 +54,13 @@ impl MirrorFs {
             stripes.push(Mutex::new(()));
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = crate::worker::spawn(Arc::clone(&queue), remote, Arc::clone(&stop), debug)?;
+        let worker = crate::worker::spawn(
+            Arc::clone(&queue),
+            local.clone(),
+            remote,
+            Arc::clone(&stop),
+            debug,
+        )?;
         Ok(Self {
             local,
             debug,
@@ -105,13 +111,16 @@ impl MirrorFs {
     }
 
     fn enqueue(&self, op: &Op) -> Result<(), Errno> {
-        self.queue.push(op).map(|_| ()).map_err(|err| {
-            eprintln!(
-                "mirrorfs: queue append failed for {}: {err}",
-                op.path().display()
-            );
-            Errno::from(err)
-        })
+        self.queue
+            .push_for_remote(&self.local, op)
+            .map(|_| ())
+            .map_err(|err| {
+                eprintln!(
+                    "mirrorfs: queue append failed for {}: {err}",
+                    op.path().display()
+                );
+                Errno::from(err)
+            })
     }
 
     fn alloc_fh(&self) -> u64 {

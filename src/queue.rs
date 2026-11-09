@@ -1,13 +1,11 @@
-// The worker in a later revision drains `pending` and decodes records.
-// Until that call exists, a binary build does not reach the decode path.
-#![cfg_attr(not(test), allow(dead_code))]
-
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::util::QUEUE_DIR_NAME;
+use crate::util::{self, QUEUE_DIR_NAME};
 
 const MAGIC: &[u8; 4] = b"MFQ1";
 const VERSION: u32 = 1;
@@ -156,10 +154,18 @@ pub struct Snapshot {
     pub data: Vec<u8>,
 }
 
+const BASE_MAGIC: &[u8; 4] = b"MFQB";
+
+struct State {
+    next: u64,
+    /// Paths the remote already has, not counting records still in the queue.
+    base: HashSet<PathBuf>,
+}
+
 /// Persistent FIFO stored in `<local>/.mirrorfs-queue/`.
 pub struct Queue {
     dir: PathBuf,
-    inner: Mutex<u64>,
+    inner: Mutex<State>,
 }
 
 impl Queue {
@@ -180,34 +186,52 @@ impl Queue {
             }
         }
         let next = pending_seqs(&dir)?.into_iter().max().unwrap_or(0) + 1;
+        let base = load_base(&dir.join("base.log"))?;
         Ok(Self {
             dir,
-            inner: Mutex::new(next),
+            inner: Mutex::new(State { next, base }),
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
     /// Append one record. The directory fsync returns only after the record
     /// will survive a crash.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn push(&self, op: &Op) -> io::Result<u64> {
-        let mut next = self.inner.lock().expect("queue lock");
-        let seq = *next;
-        let tmp = self.dir.join(format!("{seq:020}.op.tmp"));
-        let final_path = self.dir.join(format!("{seq:020}.op"));
-        {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            file.write_all(&op.encode())?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &final_path)?;
-        fsync_dir(&self.dir)?;
-        *next = seq + 1;
-        Ok(seq)
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        write_op(&dir, &mut state, op)
     }
 
+    /// Queue `op`. A write or metadata change for a path the remote does not
+    /// yet have is preceded by a full snapshot of the local object.
+    pub fn push_for_remote(&self, local_root: &Path, op: &Op) -> io::Result<u64> {
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        if wants_snapshot(op) && !effective_has(&dir, &state.base, op.path())? {
+            let snap = snapshot(local_root, op.path())?;
+            write_op(&dir, &mut state, &Op::Copy(snap))?;
+        }
+        write_op(&dir, &mut state, op)
+    }
+
+    /// Record that `op` reached the remote, then drop its queue file.
+    pub fn finish(&self, seq: u64, op: &Op) -> io::Result<()> {
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        let mut base = state.base.clone();
+        if note_effect(&mut base, op) {
+            write_base_file(&dir, &base)?;
+            state.base = base;
+        }
+        remove_record(&dir, seq)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending(&self) -> io::Result<Vec<(u64, Op)>> {
         let mut seqs = pending_seqs(&self.dir)?;
         seqs.sort_unstable();
@@ -226,17 +250,6 @@ impl Queue {
         };
         let bytes = fs::read(self.dir.join(format!("{seq:020}.op")))?;
         Ok(Some((seq, Op::decode(&bytes)?)))
-    }
-
-    /// Drop a record after the remote call has succeeded.
-    pub fn ack(&self, seq: u64) -> io::Result<()> {
-        let path = self.dir.join(format!("{seq:020}.op"));
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-        fsync_dir(&self.dir)
     }
 }
 
@@ -263,6 +276,246 @@ fn pending_seqs(dir: &Path) -> io::Result<Vec<u64>> {
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     let file = File::open(dir)?;
     file.sync_all()
+}
+
+fn write_op(dir: &Path, state: &mut State, op: &Op) -> io::Result<u64> {
+    let seq = state.next;
+    let tmp = dir.join(format!("{seq:020}.op.tmp"));
+    let final_path = dir.join(format!("{seq:020}.op"));
+    {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(&op.encode())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &final_path)?;
+    fsync_dir(dir)?;
+    state.next = seq + 1;
+    Ok(seq)
+}
+
+fn remove_record(dir: &Path, seq: u64) -> io::Result<()> {
+    let path = dir.join(format!("{seq:020}.op"));
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    fsync_dir(dir)
+}
+
+fn wants_snapshot(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Write(_)
+            | Op::Setattr(_)
+            | Op::Fsync { .. }
+            | Op::Setxattr { .. }
+            | Op::Removexattr { .. }
+            | Op::Fallocate { .. }
+    )
+}
+
+fn note_effect(base: &mut HashSet<PathBuf>, op: &Op) -> bool {
+    match op {
+        Op::Create(op) => base.insert(op.path.clone()),
+        Op::Copy(op) => base.insert(op.path.clone()),
+        Op::Unlink(path) | Op::Rmdir(path) => base.remove(path),
+        _ => false,
+    }
+}
+
+fn effective_has(dir: &Path, base: &HashSet<PathBuf>, path: &Path) -> io::Result<bool> {
+    let mut set = base.clone();
+    for (_, op) in read_pending(dir)? {
+        note_effect(&mut set, &op);
+    }
+    Ok(set.contains(path))
+}
+
+fn read_pending(dir: &Path) -> io::Result<Vec<(u64, Op)>> {
+    let mut seqs = pending_seqs(dir)?;
+    seqs.sort_unstable();
+    let mut out = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        let bytes = fs::read(dir.join(format!("{seq:020}.op")))?;
+        out.push((seq, Op::decode(&bytes)?));
+    }
+    Ok(out)
+}
+
+fn load_base(path: &Path) -> io::Result<HashSet<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => return Err(err),
+    };
+    if bytes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    if bytes.len() < 16 || &bytes[..4] != BASE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "base.log has a bad header",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("base.log version {version}"),
+        ));
+    }
+    let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let mut at = 16;
+    let mut set = HashSet::with_capacity(count);
+    for _ in 0..count {
+        if at + 8 > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated base.log",
+            ));
+        }
+        let len = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+        at += 8;
+        if at + len > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated base.log path",
+            ));
+        }
+        set.insert(PathBuf::from(std::ffi::OsStr::from_bytes(
+            &bytes[at..at + len],
+        )));
+        at += len;
+    }
+    Ok(set)
+}
+
+fn write_base_file(dir: &Path, base: &HashSet<PathBuf>) -> io::Result<()> {
+    let tmp = dir.join("base.log.tmp");
+    let final_path = dir.join("base.log");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BASE_MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(base.len() as u64).to_le_bytes());
+        for path in base {
+            let raw = path.as_os_str().as_bytes();
+            bytes.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(raw);
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &final_path)?;
+    fsync_dir(dir)
+}
+
+fn snapshot(local_root: &Path, rel: &Path) -> io::Result<Snapshot> {
+    let full = local_root.join(rel);
+    let st = util::lstat(&full)?;
+    let kind = kind_of_mode(st.st_mode);
+    let data = if kind == ObjectKind::File {
+        fs::read(&full)?
+    } else {
+        Vec::new()
+    };
+    let symlink = if kind == ObjectKind::Symlink {
+        fs::read_link(&full)?.as_os_str().as_bytes().to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(Snapshot {
+        path: rel.to_path_buf(),
+        kind,
+        mode: st.st_mode & 0o7777,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        rdev: st.st_rdev as u32,
+        atime: (st.st_atime, st.st_atime_nsec),
+        mtime: (st.st_mtime, st.st_mtime_nsec),
+        symlink,
+        xattrs: list_xattrs(&full)?,
+        data,
+    })
+}
+
+fn kind_of_mode(mode: u32) -> ObjectKind {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => ObjectKind::Dir,
+        libc::S_IFIFO => ObjectKind::Fifo,
+        libc::S_IFCHR => ObjectKind::Char,
+        libc::S_IFBLK => ObjectKind::Block,
+        libc::S_IFSOCK => ObjectKind::Socket,
+        libc::S_IFLNK => ObjectKind::Symlink,
+        _ => ObjectKind::File,
+    }
+}
+
+fn list_xattrs(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = util::cstring(path)?;
+    let mut size = unsafe { libc::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return empty_if_unsupported();
+    }
+    let mut names = vec![0u8; size as usize];
+    size = unsafe {
+        libc::llistxattr(
+            c.as_ptr(),
+            names.as_mut_ptr() as *mut libc::c_char,
+            names.len(),
+        )
+    };
+    if size < 0 {
+        return empty_if_unsupported();
+    }
+    names.truncate(size as usize);
+    let mut out = Vec::new();
+    for name in names.split(|byte| *byte == 0) {
+        if name.is_empty() {
+            continue;
+        }
+        out.push((name.to_vec(), get_xattr(&c, name)?));
+    }
+    Ok(out)
+}
+
+fn get_xattr(path: &std::ffi::CString, name: &[u8]) -> io::Result<Vec<u8>> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name contains NUL"))?;
+    let mut size =
+        unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut value = vec![0u8; size as usize];
+    size = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr() as *mut libc::c_void,
+            value.len(),
+        )
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    value.truncate(size as usize);
+    Ok(value)
+}
+
+fn empty_if_unsupported<T>() -> io::Result<Vec<T>> {
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+        Ok(Vec::new())
+    } else {
+        Err(err)
+    }
 }
 
 impl Op {
@@ -809,6 +1062,56 @@ mod tests {
         let extra = Op::Unlink(PathBuf::from("later"));
         let seq = queue.push(&extra).unwrap();
         assert_eq!(seq, ops.len() as u64 + 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_file_is_snapshotted_once() {
+        let root = std::env::temp_dir().join(format!(
+            "mirrorfs-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("pre")).unwrap();
+        let file = root.join("pre/exist.txt");
+        fs::write(&file, b"original\n").unwrap();
+        fs::write(root.join("pre/skip.txt"), b"nope").unwrap();
+        let queue = Queue::open(&root).unwrap();
+        let write = Op::Write(WriteData {
+            path: PathBuf::from("pre/exist.txt"),
+            offset: 9,
+            data: b"more\n".to_vec(),
+        });
+        // The local file already contains the post-mutation bytes.
+        fs::write(&file, b"original\nmore\n").unwrap();
+        queue.push_for_remote(&root, &write).unwrap();
+        let pending = queue.pending().unwrap();
+        assert_eq!(pending.len(), 2);
+        match &pending[0].1 {
+            Op::Copy(snap) => {
+                assert_eq!(snap.data, b"original\nmore\n");
+                assert_eq!(snap.path, PathBuf::from("pre/exist.txt"));
+                assert_eq!(snap.kind, ObjectKind::File);
+            }
+            other => panic!("expected copy, got {other:?}"),
+        }
+        assert_eq!(pending[1].1, write);
+        queue
+            .push_for_remote(
+                &root,
+                &Op::Write(WriteData {
+                    path: PathBuf::from("pre/exist.txt"),
+                    offset: 0,
+                    data: b"Z".to_vec(),
+                }),
+            )
+            .unwrap();
+        let pending = queue.pending().unwrap();
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(pending[2].1, Op::Write(_)));
         let _ = fs::remove_dir_all(&root);
     }
 }

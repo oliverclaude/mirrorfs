@@ -31,7 +31,10 @@ The local directory is the only source of truth.
   created or copied, the worker first writes a full copy of the local object
   (file bytes or symlink target, mode, uid, gid, timestamps, and xattrs) and
   only then applies the mutation. Parent directories are created as needed so
-  the copy has somewhere to land. Sibling files are not copied.
+  the copy has somewhere to land. Sibling files are not copied. Copying a
+  directory copies that directory only, not the names inside it. A later
+  mutation of a path that has already been created or copied does not snapshot
+  it again.
 
 The queue is a hidden directory, `.mirrorfs-queue/`, inside the local
 directory. That name is not listed or looked up through the mount, and it is
@@ -131,13 +134,20 @@ directory and append to the queue.
 ## Known limitations
 
 - One way only. Remote edits are not pulled back, and pre-existing differences
-  are not bulk-copied. A mutation of a path that mirrorfs has not already
-  created on the remote is retried until that path exists. The full local
-  snapshot that should create the missing object (content, mode, owner,
-  timestamps, and xattrs) is not queued yet.
+  are not bulk-copied. The first mutation of an unknown path copies that
+  object only.
+- Once a path is in `base.log`, mirrorfs does not snapshot it again. Removing
+  that object on the remote, outside mirrorfs, is not detected. A later
+  mutation stays at the head of the queue until the remote object exists.
 - A replayed create or write gets its timestamps when the remote call runs.
-  An explicit timestamp change is stored in the queue as the resulting value
-  and applied as that value.
+  A snapshot stores the local timestamps, and the write queued after that
+  snapshot then updates the remote file mtime. An explicit timestamp change
+  is stored in the queue as the resulting value and applied as that value.
+- Missing parent directories are created from the local directory's mode,
+  owner, and timestamps. After a create or copy, ancestor directories owned
+  by the mounter are stamped from the local directory again, because adding
+  the child updates the directory mtime. A parent owned by someone else is
+  left unchanged.
 - The first mutation of a file the remote does not yet have reads the whole
   local file into the queue. That copy is buffered in memory while it is
   written to `.mirrorfs-queue/`.
@@ -161,6 +171,6 @@ The checked items in `TODO.md` are what currently works. One background thread
 applies the oldest `.mirrorfs-queue/` record to the remote directory and
 deletes it only after that call succeeds. A remote error leaves the record in
 place and retries it, including after the process is killed. A mutation of a
-path mirrorfs has not already created on the remote stays at the head of the
-queue until that path exists. The next piece is the full local snapshot that
-should create it.
+path mirrorfs has not already created or copied is preceded by a snapshot of
+that local object. The next piece is rename, link, symlink, xattr, and
+fallocate.
