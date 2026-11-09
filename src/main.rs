@@ -1,5 +1,6 @@
 mod fs;
 mod inode;
+mod queue;
 mod util;
 
 use std::io::{self, ErrorKind};

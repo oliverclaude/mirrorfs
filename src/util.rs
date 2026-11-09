@@ -84,6 +84,70 @@ pub fn attr_from_stat(fuse_ino: u64, st: &libc::stat) -> FileAttr {
     }
 }
 
+pub fn chmod_path(path: &Path, mode: u32) -> io::Result<()> {
+    let c = cstring(path)?;
+    let rc = unsafe { libc::chmod(c.as_ptr(), mode) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn lchown_path(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    let c = cstring(path)?;
+    let rc = unsafe { libc::lchown(c.as_ptr(), uid, gid) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn fchmod_fd(fd: i32, mode: u32) -> io::Result<()> {
+    let rc = unsafe { libc::fchmod(fd, mode) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn fchown_fd(fd: i32, uid: u32, gid: u32) -> io::Result<()> {
+    let rc = unsafe { libc::fchown(fd, uid, gid) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn utimens_nofollow(path: &Path, times: &[libc::timespec; 2]) -> io::Result<()> {
+    let c = cstring(path)?;
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn futimens_fd(fd: i32, times: &[libc::timespec; 2]) -> io::Result<()> {
+    let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub fn trace(debug: bool, op: &str, path: &Path, result: &str, queued: bool) {
     if debug {
         eprintln!(

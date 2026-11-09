@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Inode cache for one mount.
 ///
@@ -115,6 +115,71 @@ impl InodeTable {
         }
     }
 
+    pub fn fuse_for_local(&self, local_ino: u64) -> Option<u64> {
+        self.by_local.get(&local_ino).copied()
+    }
+
+    pub fn paths_for(&self, ino: u64) -> Vec<PathBuf> {
+        self.by_rel
+            .iter()
+            .filter_map(|(path, id)| (*id == ino).then(|| path.clone()))
+            .collect()
+    }
+
+    pub fn retarget(&mut self, ino: u64, rel: PathBuf) {
+        if let Some(inode) = self.by_ino.get_mut(&ino) {
+            inode.rel = rel;
+        }
+    }
+
+    /// Drop directory entries for `ino` but keep the record while the kernel
+    /// still holds a lookup. Otherwise a recycled `st_ino` would be treated
+    /// as this fuse inode.
+    pub fn detach(&mut self, ino: u64) {
+        if ino == 1 {
+            return;
+        }
+        let Some(inode) = self.by_ino.get(&ino) else {
+            return;
+        };
+        let local_ino = inode.local_ino;
+        let nlookup = inode.nlookup;
+        if self.by_local.get(&local_ino) == Some(&ino) {
+            self.by_local.remove(&local_ino);
+        }
+        for path in self.paths_for(ino) {
+            self.by_rel.remove(&path);
+        }
+        if nlookup == 0 {
+            self.by_ino.remove(&ino);
+        }
+    }
+
+    /// Drop one directory entry. If it was the path used for getattr, switch
+    /// to another hard link that is still cached. The last name also drops
+    /// the `st_ino` map so the number can be reused safely.
+    pub fn unbind(&mut self, rel: &Path) {
+        let Some(ino) = self.by_rel.get(rel).copied() else {
+            return;
+        };
+        self.by_rel.remove(rel);
+        let (local_ino, canonical) = {
+            let Some(inode) = self.by_ino.get(&ino) else {
+                return;
+            };
+            (inode.local_ino, inode.rel.clone())
+        };
+        if let Some(other) = self.paths_for(ino).into_iter().next() {
+            if canonical.as_path() == rel {
+                self.retarget(ino, other);
+            }
+            return;
+        }
+        if self.by_local.get(&local_ino) == Some(&ino) {
+            self.by_local.remove(&local_ino);
+        }
+    }
+
     pub fn forget(&mut self, ino: u64, nlookup: u64) {
         if ino == 1 {
             return;
@@ -130,15 +195,13 @@ impl InodeTable {
             return;
         }
         let local_ino = inode.local_ino;
-        let paths: Vec<PathBuf> = self
-            .by_rel
-            .iter()
-            .filter_map(|(path, id)| (*id == ino).then(|| path.clone()))
-            .collect();
-        for path in paths {
+        for path in self.paths_for(ino) {
             self.by_rel.remove(&path);
         }
-        self.by_local.remove(&local_ino);
+        // A reused st_ino may already belong to a newer fuse inode.
+        if self.by_local.get(&local_ino) == Some(&ino) {
+            self.by_local.remove(&local_ino);
+        }
         self.by_ino.remove(&ino);
     }
 
@@ -188,5 +251,34 @@ mod tests {
         let ino = table.intern(PathBuf::from("a"), 1, 10, false);
         table.forget(ino, 1);
         assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn unbind_retargets_the_canonical_hard_link() {
+        let mut table = InodeTable::new(2);
+        let ino = table.intern(PathBuf::from("a"), 1, 10, true);
+        table.intern(PathBuf::from("b"), 1, 10, true);
+        table.unbind(Path::new("b"));
+        assert_eq!(table.rel(ino).unwrap().as_os_str(), "a");
+        table.intern(PathBuf::from("b"), 1, 10, true);
+        table.unbind(Path::new("a"));
+        assert_eq!(table.rel(ino).unwrap().as_os_str(), "b");
+        assert!(table.get(ino).is_some());
+        let again = table.intern(PathBuf::from("c"), 1, 10, true);
+        assert_eq!(again, ino);
+    }
+
+    #[test]
+    fn unbind_last_name_does_not_alias_a_reused_inode() {
+        let mut table = InodeTable::new(2);
+        let first = table.intern(PathBuf::from("a"), 1, 10, true);
+        table.unbind(Path::new("a"));
+        let second = table.intern(PathBuf::from("b"), 1, 10, true);
+        assert_ne!(first, second);
+        assert_eq!(table.rel(second).unwrap().as_os_str(), "b");
+        table.forget(first, 1);
+        let linked = table.intern(PathBuf::from("c"), 1, 10, true);
+        assert_eq!(linked, second);
+        assert_eq!(table.rel(first), None);
     }
 }

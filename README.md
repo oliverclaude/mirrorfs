@@ -153,5 +153,7 @@ directory and append to the queue.
 
 ## Status
 
-The checked items in `TODO.md` are what currently works. Reads return local
-bytes. Mutations are not accepted yet; the next piece is the persistent queue.
+The checked items in `TODO.md` are what currently works. Mutations are applied
+to the local directory and appended to `.mirrorfs-queue/`. Those records stay
+on disk across unmount and restart. The remote directory is not updated yet;
+the next piece is the background worker that drains the queue.
