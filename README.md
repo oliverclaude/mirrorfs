@@ -22,8 +22,11 @@ The local directory is the only source of truth.
   directory is never held open.
 - Metadata changes (`chmod`, `chown`, `utimens`, `setxattr`, and the rest of
   `setattr`) use the same path: local first, then queue.
-- Changes made outside the mount, whether on the local directory or on the
-  remote directory, are invisible. Nothing walks either tree looking for them.
+- Out-of-band changes are not detected and are not queued. A lookup still
+  reads the local directory, because that directory is the source of truth, so
+  a file written directly under `--local` can show up on a later lookup.
+  Nothing compares the two trees, and a file that exists only on the remote is
+  never served.
 - If a queued mutation needs a remote object that mirrorfs has not already
   created or copied, the worker first writes a full copy of the local object
   (file bytes or symlink target, mode, uid, gid, timestamps, and xattrs) and
@@ -150,5 +153,5 @@ directory and append to the queue.
 
 ## Status
 
-The checked items in `TODO.md` are what currently works. The binary currently
-validates its arguments and exits. It does not mount yet.
+The checked items in `TODO.md` are what currently works. File contents cannot
+be read or written through the mount yet; `open` and `read` are next.
