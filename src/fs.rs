@@ -1,12 +1,18 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fuser::{
-    Errno, FileType, Filesystem, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
+    Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
+    OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, Request,
 };
 
 use crate::inode::InodeTable;
@@ -18,6 +24,19 @@ pub struct MirrorFs {
     remote: PathBuf,
     debug: bool,
     inodes: Mutex<InodeTable>,
+    files: Mutex<HashMap<u64, OpenFile>>,
+    dirs: Mutex<HashMap<u64, OpenDir>>,
+    next_fh: AtomicU64,
+}
+
+struct OpenFile {
+    file: Arc<File>,
+    rel: PathBuf,
+}
+
+struct OpenDir {
+    rel: PathBuf,
+    entries: Vec<DirEntry>,
 }
 
 impl MirrorFs {
@@ -28,7 +47,14 @@ impl MirrorFs {
             remote,
             debug,
             inodes: Mutex::new(InodeTable::new(st.st_ino)),
+            files: Mutex::new(HashMap::new()),
+            dirs: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
         })
+    }
+
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 
     fn trace(&self, op: &str, path: &std::path::Path, result: &str) {
@@ -194,18 +220,7 @@ impl Filesystem for MirrorFs {
         }
     }
 
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
-        reply.opened(fuser::FileHandle(0), FopenFlags::empty());
-    }
-
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: fuser::FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -213,32 +228,174 @@ impl Filesystem for MirrorFs {
                 return;
             }
         };
-        let entries = match self.read_dir_entries(ino.0, &rel) {
-            Ok(entries) => entries,
+        match self.open_local(&rel, flags) {
+            Ok(file) => {
+                let fh = self.alloc_fh();
+                self.files.lock().expect("file lock").insert(
+                    fh,
+                    OpenFile {
+                        file,
+                        rel: rel.clone(),
+                    },
+                );
+                self.trace("open", &rel, "ok");
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            }
             Err(errno) => {
-                self.trace("readdir", &rel, &errno_label(errno));
+                self.trace("open", &rel, &errno_label(errno));
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        let open = {
+            let files = self.files.lock().expect("file lock");
+            match files.get(&fh.0) {
+                Some(open) => (Arc::clone(&open.file), open.rel.clone()),
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
+        };
+        let mut buf = vec![0u8; size as usize];
+        match open.0.read_at(&mut buf, offset) {
+            Ok(n) => {
+                self.trace("read", &open.1, "ok");
+                reply.data(&buf[..n]);
+            }
+            Err(err) => {
+                let errno = Errno::from(err);
+                self.trace("read", &open.1, &errno_label(errno));
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let rel = self
+            .files
+            .lock()
+            .expect("file lock")
+            .get(&fh.0)
+            .map(|open| open.rel.clone());
+        if let Some(rel) = rel {
+            self.trace("flush", &rel, "ok");
+        }
+        reply.ok();
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(open) = self.files.lock().expect("file lock").remove(&fh.0) {
+            self.trace("release", &open.rel, "ok");
+        }
+        reply.ok();
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
                 reply.error(errno);
                 return;
             }
         };
-        self.trace("readdir", &rel, "ok");
-        for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            let next = (index as u64) + 1;
-            if reply.add(INodeNo(entry.ino), next, entry.kind, entry.name) {
-                break;
+        match self.read_dir_entries(ino.0, &rel) {
+            Ok(entries) => {
+                let fh = self.alloc_fh();
+                self.dirs.lock().expect("dir lock").insert(
+                    fh,
+                    OpenDir {
+                        rel: rel.clone(),
+                        entries,
+                    },
+                );
+                self.trace("opendir", &rel, "ok");
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            }
+            Err(errno) => {
+                self.trace("opendir", &rel, &errno_label(errno));
+                reply.error(errno);
             }
         }
-        reply.ok();
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectory,
+    ) {
+        let snapshot = {
+            let dirs = self.dirs.lock().expect("dir lock");
+            dirs.get(&fh.0)
+                .map(|dir| (dir.rel.clone(), dir.entries.clone()))
+        };
+        let Some((rel, entries)) = snapshot else {
+            // A zero handle means the kernel did not use our opendir result.
+            let rel = match self.rel_of(ino.0) {
+                Ok(rel) => rel,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+            match self.read_dir_entries(ino.0, &rel) {
+                Ok(entries) => {
+                    self.trace("readdir", &rel, "ok");
+                    fill_dir(&entries, offset, reply);
+                }
+                Err(errno) => {
+                    self.trace("readdir", &rel, &errno_label(errno));
+                    reply.error(errno);
+                }
+            }
+            return;
+        };
+        self.trace("readdir", &rel, "ok");
+        fill_dir(&entries, offset, reply);
     }
 
     fn releasedir(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: fuser::FileHandle,
-        _flags: fuser::OpenFlags,
-        reply: fuser::ReplyEmpty,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
     ) {
+        if let Some(dir) = self.dirs.lock().expect("dir lock").remove(&fh.0) {
+            self.trace("releasedir", &dir.rel, "ok");
+        }
         reply.ok();
     }
 
@@ -270,6 +427,7 @@ impl Filesystem for MirrorFs {
     }
 }
 
+#[derive(Clone)]
 struct DirEntry {
     ino: u64,
     kind: FileType,
@@ -277,6 +435,25 @@ struct DirEntry {
 }
 
 impl MirrorFs {
+    fn open_local(&self, rel: &std::path::Path, flags: OpenFlags) -> Result<Arc<File>, Errno> {
+        let full = util::local_path(&self.local, rel);
+        let c = util::cstring(&full).map_err(Errno::from)?;
+        let mut oflags = match flags.acc_mode() {
+            OpenAccMode::O_RDONLY => libc::O_RDONLY,
+            OpenAccMode::O_WRONLY => libc::O_WRONLY,
+            OpenAccMode::O_RDWR => libc::O_RDWR,
+        };
+        oflags |= libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if flags.0 & libc::O_APPEND != 0 {
+            oflags |= libc::O_APPEND;
+        }
+        let fd = unsafe { libc::open(c.as_ptr(), oflags) };
+        if fd < 0 {
+            return Err(Errno::from(io::Error::last_os_error()));
+        }
+        Ok(Arc::new(unsafe { File::from_raw_fd(fd) }))
+    }
+
     fn read_dir_entries(
         &self,
         dir_ino: u64,
@@ -327,6 +504,16 @@ impl MirrorFs {
         }
         Ok(entries)
     }
+}
+
+fn fill_dir(entries: &[DirEntry], offset: u64, mut reply: ReplyDirectory) {
+    for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
+        let next = (index as u64) + 1;
+        if reply.add(INodeNo(entry.ino), next, entry.kind, &entry.name) {
+            break;
+        }
+    }
+    reply.ok();
 }
 
 fn errno_label(errno: Errno) -> String {

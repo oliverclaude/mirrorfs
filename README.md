@@ -153,5 +153,5 @@ directory and append to the queue.
 
 ## Status
 
-The checked items in `TODO.md` are what currently works. File contents cannot
-be read or written through the mount yet; `open` and `read` are next.
+The checked items in `TODO.md` are what currently works. Reads return local
+bytes. Mutations are not accepted yet; the next piece is the persistent queue.

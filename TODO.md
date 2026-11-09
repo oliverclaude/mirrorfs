@@ -5,7 +5,7 @@ Each item is implemented, manually tested against `/mnt/claude_local` and
 
 - [x] Project skeleton, CLI, README, and this checklist
 - [x] Mount, lookup, getattr, readdir, readlink, statfs, forget
-- [ ] Open, read, flush, release, opendir, releasedir
+- [x] Open, read, flush, release, opendir, releasedir
 - [ ] Local mutations plus a persistent FIFO queue under `.mirrorfs-queue/`
 - [ ] Background worker that applies the queue to the remote directory
 - [ ] Full local snapshot queued ahead of a mutation when the remote object is unknown
