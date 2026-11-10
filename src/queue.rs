@@ -520,7 +520,7 @@ fn write_base_file(dir: &Path, base: &HashSet<PathBuf>) -> io::Result<()> {
     fsync_dir(dir)
 }
 
-fn snapshot(local_root: &Path, rel: &Path) -> io::Result<Snapshot> {
+pub(crate) fn snapshot(local_root: &Path, rel: &Path) -> io::Result<Snapshot> {
     let full = local_root.join(rel);
     let st = util::lstat(&full)?;
     let kind = kind_of_mode(st.st_mode);

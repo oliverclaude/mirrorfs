@@ -49,8 +49,10 @@ sequence number. Records are fsynced and renamed into place, and the queue
 directory itself is fsynced, so a crash or restart keeps every operation that
 had been accepted. The worker deletes a record only after the remote call
 succeeds. A remote outage leaves the record in place and retries it with
-backoff. Order is preserved: a later record is not applied before an earlier
-one.
+backoff. If the remote directory can still be stated and the call fails,
+the worker copies the corresponding local object onto the remote and
+applies the operation again. Order is preserved: a later record is not
+applied before an earlier one.
 
 On `SIGINT`, `SIGTERM`, or unmount, mirrorfs stops accepting FUSE calls,
 tries to finish the record it is currently applying, and leaves any remaining
@@ -132,7 +134,12 @@ Location: `<local>/.mirrorfs-queue/`.
 A base copy stores the local object's content and attributes inside its `.op`
 file at the moment the mutation is queued. The worker does not re-read the
 live local file for that copy, so a later mutation cannot change the bytes of
-an earlier snapshot.
+an earlier snapshot. A repair does re-read the live local object for every
+other operation. An exchange is repaired by copying both local names and
+leaving them there: applying the exchange afterwards would swap them back.
+A plain rename moves the remote source when it is still present, so the
+names inside a directory move with it, and copies the local destination
+only when that source is gone.
 
 While the worker is retrying, new FUSE calls still complete against the local
 directory and append to the queue.
@@ -155,8 +162,10 @@ directory at the mount root:
 | `errors` | Remote apply failures and queue read or append failures. The newest 64 distinct messages are kept. Repeating the latest message refreshes its timestamp instead of adding a line. |
 
 `fuse_errors` counts FUSE results other than success, including an ordinary
-miss such as `ENOENT`. `remote_retries` counts failed attempts to apply a
-record. The directory is mode `0555` and the files are mode `0444`, owned by
+miss such as `ENOENT`. `remote_retries` counts attempts that left the record
+queued. A failure that the worker repaired is listed in `errors` with
+`recovered` and is not added to `remote_retries`. The directory is mode
+`0555` and the files are mode `0444`, owned by
 the user who mounted the filesystem. The kernel then denies writes with
 `EACCES`. A change that reaches mirrorfs, such as removing the directory,
 returns `EROFS`. Creating the name `sys` at the mount root fails because that
@@ -167,9 +176,21 @@ directory is already there.
 - One way only. Remote edits are not pulled back, and pre-existing differences
   are not bulk-copied. The first mutation of an unknown path copies that
   object only.
-- Once a path is in `base.log`, mirrorfs does not snapshot it again. Removing
-  that object on the remote, outside mirrorfs, is not detected. A later
-  mutation stays at the head of the queue until the remote object exists.
+- Once a path is in `base.log`, a later mutation does not snapshot it again
+  at enqueue time. If applying that mutation fails while the remote
+  directory can still be stated, the worker copies the live local object
+  over the remote path and applies the queued operation once more. A queued
+  copy is replayed from the bytes stored in the record. An exchange copies
+  both local names and does not swap them again. A plain rename moves the
+  remote source when that source still exists. Unlink and rmdir remove a
+  conflicting remote node, including a non-empty directory at that path.
+  Copying a directory still copies that directory only, not the names inside
+  it. If the remote root cannot be stated, or the copy fails (permissions,
+  a full disk), the record stays queued and the worker backs off from 200ms
+  up to 5s. The repair reads the live local file without the lock that
+  covers FUSE writes, so a write that arrives during the copy can race it.
+  The queued mutation is still applied afterwards, and later records run
+  in order.
 - A replayed create or write gets its timestamps when the remote call runs.
   A snapshot stores the local timestamps, and the write queued after that
   snapshot then updates the remote file mtime. An explicit timestamp change
@@ -224,4 +245,5 @@ locally and queued the same way. A rename of a tree mirrorfs already knows
 moves that tree on the remote. A rename of a path it does not know copies
 the local object at its new path. `<mount>/sys/stats`, `sys/queue`, and
 `sys/errors` report counters, the records still waiting, and recent remote
-or queue failures.
+or queue failures. A remote error while that directory is still reachable
+is repaired by copying the local object and applying the operation again.

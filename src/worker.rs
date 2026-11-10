@@ -58,49 +58,323 @@ fn run(
             wait(&stop, RETRY_MIN);
             continue;
         };
-        match apply(&local, &remote, &op) {
-            Ok(()) => {
-                if let Err(err) = queue.finish(seq, &op) {
-                    counters.note_error(format!(
-                        "queue ack {seq} op={} path={} result={err}",
-                        op.kind_name(),
-                        op.path().display()
-                    ));
-                    eprintln!("mirrorfs: queue ack {seq} failed: {err}");
-                    wait(&stop, backoff);
-                    backoff = grow(backoff);
-                    continue;
-                }
-                counters.note_remote_ok();
-                if debug {
-                    eprintln!(
-                        "mirrorfs remote op={} path={} result=ok",
-                        op.kind_name(),
-                        op.path().display()
-                    );
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
-                backoff = RETRY_MIN;
-            }
+        let recovered = match apply(&local, &remote, &op) {
+            Ok(()) => None,
             Err(err) => {
-                counters.note_remote_retry(format!(
-                    "remote op={} path={} result={err}",
-                    op.kind_name(),
-                    op.path().display()
-                ));
-                eprintln!(
-                    "mirrorfs remote op={} path={} result={err} retry",
-                    op.kind_name(),
-                    op.path().display()
-                );
-                let _ = std::io::Write::flush(&mut std::io::stderr());
                 if stop.load(Ordering::Relaxed) {
+                    log_retry(&op, &err);
                     break;
                 }
-                wait(&stop, backoff);
-                backoff = grow(backoff);
+                match repair(&local, &remote, &op, &err) {
+                    Repair::Done => Some(err),
+                    Repair::Unchanged => {
+                        log_retry(&op, &err);
+                        counters.note_remote_retry(retry_message(&op, &err));
+                        wait(&stop, backoff);
+                        backoff = grow(backoff);
+                        continue;
+                    }
+                    Repair::Failed(fix_err) => {
+                        log_retry(&op, &fix_err);
+                        counters.note_remote_retry(retry_message(&op, &fix_err));
+                        wait(&stop, backoff);
+                        backoff = grow(backoff);
+                        continue;
+                    }
+                }
+            }
+        };
+        if let Err(err) = queue.finish(seq, &op) {
+            counters.note_error(format!(
+                "queue ack {seq} op={} path={} result={err}",
+                op.kind_name(),
+                op.path().display()
+            ));
+            eprintln!("mirrorfs: queue ack {seq} failed: {err}");
+            wait(&stop, backoff);
+            backoff = grow(backoff);
+            continue;
+        }
+        counters.note_remote_ok();
+        if debug {
+            eprintln!(
+                "mirrorfs remote op={} path={} result=ok",
+                op.kind_name(),
+                op.path().display()
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        if let Some(err) = recovered {
+            counters.note_error(format!(
+                "remote op={} path={} result={err} recovered",
+                op.kind_name(),
+                op.path().display()
+            ));
+        }
+        backoff = RETRY_MIN;
+    }
+}
+
+fn retry_message(op: &Op, err: &io::Error) -> String {
+    format!(
+        "remote op={} path={} result={err}",
+        op.kind_name(),
+        op.path().display()
+    )
+}
+
+fn log_retry(op: &Op, err: &io::Error) {
+    eprintln!(
+        "mirrorfs remote op={} path={} result={err} retry",
+        op.kind_name(),
+        op.path().display()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+enum Repair {
+    /// The remote now matches the operation.
+    Done,
+    /// Mount is down, or the record itself is invalid. Retry the original error.
+    Unchanged,
+    /// A repair was attempted and failed. Retry this error.
+    Failed(io::Error),
+}
+
+/// One repair when `apply` fails and the remote directory can still be stated.
+/// A missing remote root keeps the old backoff and does not copy anything.
+fn repair(local: &Path, remote: &Path, op: &Op, err: &io::Error) -> Repair {
+    if err.kind() == ErrorKind::InvalidInput || !mount_available(remote) {
+        return Repair::Unchanged;
+    }
+    eprintln!(
+        "mirrorfs: remote op={} path={} result={err}; copying the local object and retrying the operation",
+        op.kind_name(),
+        op.path().display()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    match fix(local, remote, op) {
+        Ok(()) => Repair::Done,
+        Err(fix_err) => Repair::Failed(fix_err),
+    }
+}
+
+fn mount_available(remote_root: &Path) -> bool {
+    match util::lstat(remote_root) {
+        Ok(st) => st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        Err(_) => false,
+    }
+}
+
+/// Copy the local object onto the remote path, then apply the queued mutation.
+///
+/// A `Copy` record is written from the bytes it already stores. Re-reading
+/// the live file would let a later mutation change an earlier snapshot.
+/// An exchange copies both post-exchange local names and does not swap them:
+/// swapping again would undo the copy. A plain rename moves the remote
+/// source when that source still exists, so a directory's children move
+/// with it instead of being replaced by a copy of the destination.
+fn fix(local: &Path, remote: &Path, op: &Op) -> io::Result<()> {
+    match op {
+        Op::Copy(snap) => {
+            let path = remote_path(remote, &snap.path)?;
+            assert_child(remote, &path)?;
+            clear_conflict(&path, snap.kind)?;
+            apply_copy(local, remote, snap)
+        }
+        Op::Rename { from, to, flags } if *flags & libc::RENAME_EXCHANGE != 0 => {
+            replace_from_local(local, remote, to)?;
+            replace_from_local(local, remote, from)?;
+            Ok(())
+        }
+        Op::Rename { from, to, flags } => fix_rename(local, remote, from, to, *flags),
+        Op::Link { from, to } => fix_link(local, remote, from, to),
+        Op::Unlink(path) => fix_unlink(remote, path),
+        Op::Rmdir(path) => fix_rmdir(remote, path),
+        other => fix_object(local, remote, other),
+    }
+}
+
+fn fix_object(local: &Path, remote: &Path, op: &Op) -> io::Result<()> {
+    let rel = op.path();
+    let _ = remote_path(remote, rel)?;
+    match replace_from_local(local, remote, rel) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match apply(local, remote, op) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound && !local_exists(local, rel)? => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn fix_rename(local: &Path, remote: &Path, from: &Path, to: &Path, flags: u32) -> io::Result<()> {
+    let src = remote_path(remote, from)?;
+    if path_exists(&src)? {
+        match rename_over(local, remote, from, to, flags, &src) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound && !path_exists(&src)? => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if local_exists(local, to)? {
+        match replace_from_local(local, remote, to) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        return apply_rename(local, remote, from, to, flags);
+    }
+    match apply_rename(local, remote, from, to, flags) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let dst = remote_path(remote, to)?;
+            if path_exists(&dst)? {
+                Err(err)
+            } else {
+                Ok(())
             }
         }
+        Err(err) => Err(err),
+    }
+}
+
+fn rename_over(
+    local: &Path,
+    remote: &Path,
+    from: &Path,
+    to: &Path,
+    flags: u32,
+    src: &Path,
+) -> io::Result<()> {
+    match apply_rename(local, remote, from, to, flags) {
+        Ok(()) => Ok(()),
+        Err(err) if blocks_rename(&err) => {
+            let dst = remote_path(remote, to)?;
+            assert_child(remote, &dst)?;
+            remove_blocking(&dst, Some(src))?;
+            apply_rename(local, remote, from, to, flags)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn blocks_rename(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::AlreadyExists
+            | ErrorKind::DirectoryNotEmpty
+            | ErrorKind::IsADirectory
+            | ErrorKind::NotADirectory
+    )
+}
+
+fn fix_link(local: &Path, remote: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    let src = remote_path(remote, from)?;
+    let dst = remote_path(remote, to)?;
+    match replace_from_local(local, remote, from) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match apply_link(local, remote, from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists && dst != src => {
+            assert_child(remote, &dst)?;
+            remove_blocking(&dst, Some(&src))?;
+            apply_link(local, remote, from, to)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn fix_unlink(remote: &Path, rel: &Path) -> io::Result<()> {
+    let full = remote_path(remote, rel)?;
+    assert_child(remote, &full)?;
+    match remove_file(&full) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::IsADirectory => remove_blocking(&full, None),
+        Err(err) => Err(err),
+    }
+}
+
+fn fix_rmdir(remote: &Path, rel: &Path) -> io::Result<()> {
+    let full = remote_path(remote, rel)?;
+    assert_child(remote, &full)?;
+    match remove_dir(&full) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotADirectory => remove_file(&full),
+        Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => remove_blocking(&full, None),
+        Err(err) => Err(err),
+    }
+}
+
+fn replace_from_local(local: &Path, remote: &Path, rel: &Path) -> io::Result<()> {
+    let remote_full = remote_path(remote, rel)?;
+    assert_child(remote, &remote_full)?;
+    let snap = crate::queue::snapshot(local, rel)?;
+    clear_conflict(&remote_full, snap.kind)?;
+    match apply_copy(local, remote, &snap) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            // The node is there but cannot be updated in place, for example
+            // a mode 0444 file. Recreate it when the parent allows the unlink.
+            remove_blocking(&remote_full, None)?;
+            apply_copy(local, remote, &snap)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn clear_conflict(path: &Path, wanted: ObjectKind) -> io::Result<()> {
+    let st = match util::lstat(path) {
+        Ok(st) => st,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if kind_of(st.st_mode) == wanted {
+        return Ok(());
+    }
+    remove_blocking(path, None)
+}
+
+fn remove_blocking(path: &Path, protect: Option<&Path>) -> io::Result<()> {
+    if protect.is_some_and(|keep| keep != path && keep.starts_with(path)) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "refusing to remove a directory that contains the source",
+        ));
+    }
+    let st = match util::lstat(path) {
+        Ok(st) => st,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if kind_of(st.st_mode) == ObjectKind::Dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn assert_child(root: &Path, path: &Path) -> io::Result<()> {
+    if path == root || path == root.join(".") {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "refusing to replace the remote root",
+        ));
+    }
+    Ok(())
+}
+
+fn local_exists(local: &Path, rel: &Path) -> io::Result<bool> {
+    let full = remote_path(local, rel)?;
+    match util::lstat(&full) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -1229,5 +1503,220 @@ mod tests {
         let err = apply(&_local, &remote, &Op::Unlink(PathBuf::from("../outside"))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         let _ = fs::remove_dir_all(remote.parent().unwrap());
+    }
+
+    fn write_op(path: &str, offset: u64, data: &[u8]) -> Op {
+        Op::Write(WriteData {
+            path: PathBuf::from(path),
+            offset,
+            data: data.to_vec(),
+        })
+    }
+
+    #[test]
+    fn fix_restores_a_deleted_remote_file_then_applies_the_write() {
+        let (local, remote) = scratch("fix-write");
+        fs::write(local.join("a.txt"), b"hello\nmore\n").unwrap();
+        let op = write_op("a.txt", 6, b"more\n");
+        let err = apply(&local, &remote, &op).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("a.txt")).unwrap(), b"hello\nmore\n");
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_replaces_a_remote_directory_that_blocks_a_file() {
+        let (local, remote) = scratch("fix-dir");
+        fs::write(local.join("a.txt"), b"hello").unwrap();
+        fs::create_dir_all(remote.join("a.txt/nested")).unwrap();
+        fs::write(remote.join("a.txt/nested/x"), b"remote-only").unwrap();
+        let op = write_op("a.txt", 0, b"hello");
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("a.txt")).unwrap(), b"hello");
+        assert!(!remote.join("a.txt/nested").exists());
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_replaces_a_mode_0444_remote_file() {
+        let (local, remote) = scratch("fix-mode");
+        fs::write(local.join("a.txt"), b"new").unwrap();
+        fs::write(remote.join("a.txt"), b"old").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(remote.join("a.txt")).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(remote.join("a.txt"), perms).unwrap();
+        fix(&local, &remote, &write_op("a.txt", 0, b"new")).unwrap();
+        assert_eq!(fs::read(remote.join("a.txt")).unwrap(), b"new");
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_publishes_a_renamed_file_when_the_remote_source_is_gone() {
+        let (local, remote) = scratch("fix-rename-gone");
+        fs::write(local.join("new.txt"), b"copied").unwrap();
+        let op = Op::Rename {
+            from: PathBuf::from("old.txt"),
+            to: PathBuf::from("new.txt"),
+            flags: 0,
+        };
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("new.txt")).unwrap(), b"copied");
+        assert!(!remote.join("old.txt").exists());
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_renames_when_the_remote_source_still_exists() {
+        let (local, remote) = scratch("fix-rename-src");
+        fs::create_dir_all(local.join("new")).unwrap();
+        fs::create_dir_all(remote.join("old")).unwrap();
+        fs::write(remote.join("old/child"), b"moved").unwrap();
+        fs::write(remote.join("new"), b"blocker").unwrap();
+        let op = Op::Rename {
+            from: PathBuf::from("old"),
+            to: PathBuf::from("new"),
+            flags: 0,
+        };
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("new/child")).unwrap(), b"moved");
+        assert!(!remote.join("old").exists());
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_exchange_copies_both_sides_without_swapping() {
+        let (local, remote) = scratch("fix-xchg");
+        fs::write(local.join("a"), b"A2").unwrap();
+        fs::write(local.join("b"), b"B2").unwrap();
+        fs::write(remote.join("a"), b"A1").unwrap();
+        fs::write(remote.join("b"), b"B1").unwrap();
+        let op = Op::Rename {
+            from: PathBuf::from("a"),
+            to: PathBuf::from("b"),
+            flags: libc::RENAME_EXCHANGE as u32,
+        };
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("a")).unwrap(), b"A2");
+        assert_eq!(fs::read(remote.join("b")).unwrap(), b"B2");
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_replays_a_stored_copy_without_reading_the_live_file() {
+        let (local, remote) = scratch("fix-copy");
+        fs::write(local.join("a.txt"), b"live").unwrap();
+        let st = util::lstat(&local.join("a.txt")).unwrap();
+        let op = Op::Copy(Snapshot {
+            path: PathBuf::from("a.txt"),
+            kind: ObjectKind::File,
+            mode: st.st_mode & 0o7777,
+            uid: st.st_uid,
+            gid: st.st_gid,
+            rdev: 0,
+            atime: (st.st_atime, st.st_atime_nsec),
+            mtime: (st.st_mtime, st.st_mtime_nsec),
+            symlink: Vec::new(),
+            xattrs: Vec::new(),
+            data: b"stored".to_vec(),
+        });
+        fix(&local, &remote, &op).unwrap();
+        assert_eq!(fs::read(remote.join("a.txt")).unwrap(), b"stored");
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_links_after_copying_the_source() {
+        let (local, remote) = scratch("fix-link");
+        fs::write(local.join("a.txt"), b"same").unwrap();
+        fs::write(remote.join("b.txt"), b"other").unwrap();
+        let op = Op::Link {
+            from: PathBuf::from("a.txt"),
+            to: PathBuf::from("b.txt"),
+        };
+        fix(&local, &remote, &op).unwrap();
+        let left = util::lstat(&remote.join("a.txt")).unwrap();
+        let right = util::lstat(&remote.join("b.txt")).unwrap();
+        assert_eq!(left.st_ino, right.st_ino);
+        assert_eq!(fs::read(remote.join("b.txt")).unwrap(), b"same");
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_unlink_removes_a_remote_directory() {
+        let (local, remote) = scratch("fix-unlink");
+        fs::create_dir_all(remote.join("gone/nested")).unwrap();
+        fs::write(remote.join("gone/nested/x"), b"x").unwrap();
+        fix(&local, &remote, &Op::Unlink(PathBuf::from("gone"))).unwrap();
+        assert!(!remote.join("gone").exists());
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_symlink_replaces_a_remote_file() {
+        let (local, remote) = scratch("fix-symlink");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        std::os::unix::fs::symlink("target-name", local.join("link")).unwrap();
+        fs::write(remote.join("link"), b"not a link").unwrap();
+        fix(
+            &local,
+            &remote,
+            &Op::Symlink {
+                path: PathBuf::from("link"),
+                target: b"target-name".to_vec(),
+                uid,
+                gid,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(remote.join("link")).unwrap().as_os_str(),
+            "target-name"
+        );
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn mount_available_requires_the_remote_root() {
+        let (local, remote) = scratch("fix-mount");
+        assert!(mount_available(&remote));
+        assert!(!mount_available(&remote.join("missing")));
+        fs::write(remote.join("file"), b"x").unwrap();
+        assert!(!mount_available(&remote.join("file")));
+        fs::write(local.join("a.txt"), b"hello").unwrap();
+        let op = write_op("a.txt", 0, b"hello");
+        let gone = remote.join("missing-root");
+        let err = apply(&local, &gone, &op).unwrap_err();
+        assert!(matches!(
+            repair(&local, &gone, &op, &err),
+            Repair::Unchanged
+        ));
+        assert!(!gone.join("a.txt").exists());
+        let bad = Op::Unlink(PathBuf::from("../outside"));
+        let err = apply(&local, &remote, &bad).unwrap_err();
+        assert!(matches!(
+            repair(&local, &remote, &bad, &err),
+            Repair::Unchanged
+        ));
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn fix_permission_error_stays_an_error() {
+        let (local, remote) = scratch("fix-perm");
+        fs::write(local.join("a.txt"), b"hello").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&remote).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&remote, perms).unwrap();
+        let err = fix(&local, &remote, &write_op("a.txt", 0, b"hello")).unwrap_err();
+        let mut perms = fs::metadata(&remote).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&remote, perms).unwrap();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(!remote.join("a.txt").exists());
+        let _ = fs::remove_dir_all(local.parent().unwrap());
     }
 }
