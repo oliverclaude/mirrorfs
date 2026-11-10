@@ -40,7 +40,9 @@ The local directory is the only source of truth.
   the copy has somewhere to land. Sibling files are not copied. Copying a
   directory copies that directory only, not the names inside it. A later
   mutation of a path that has already been created or copied does not snapshot
-  it again.
+  it again when it is queued. If the remote apply then fails while that
+  directory is still reachable, the worker repairs the path from the live
+  local object, as described below.
 
 The queue is a hidden directory, `.mirrorfs-queue/`, inside the local
 directory. That name is not listed or looked up through the mount, and it is
@@ -165,8 +167,8 @@ directory at the mount root:
 miss such as `ENOENT`. `remote_retries` counts attempts that left the record
 queued. A failure that the worker repaired is listed in `errors` with
 `recovered` and is not added to `remote_retries`. The directory is mode
-`0555` and the files are mode `0444`, owned by
-the user who mounted the filesystem. The kernel then denies writes with
+`0555` and the files are mode `0444`, owned by the user who mounted the
+filesystem. The kernel then denies writes with
 `EACCES`. A change that reaches mirrorfs, such as removing the directory,
 returns `EROFS`. Creating the name `sys` at the mount root fails because that
 directory is already there.
