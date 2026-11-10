@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::queue::{Create, ObjectKind, Op, Queue, Setattr, Snapshot, WriteData};
+use crate::sysfs::Counters;
 use crate::util;
 
 const RETRY_MIN: Duration = Duration::from_millis(200);
@@ -21,14 +22,22 @@ pub fn spawn(
     local: PathBuf,
     remote: PathBuf,
     stop: Arc<AtomicBool>,
+    counters: Arc<Counters>,
     debug: bool,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("mirrorfs-remote".to_string())
-        .spawn(move || run(queue, local, remote, stop, debug))
+        .spawn(move || run(queue, local, remote, stop, counters, debug))
 }
 
-fn run(queue: Arc<Queue>, local: PathBuf, remote: PathBuf, stop: Arc<AtomicBool>, debug: bool) {
+fn run(
+    queue: Arc<Queue>,
+    local: PathBuf,
+    remote: PathBuf,
+    stop: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+    debug: bool,
+) {
     let mut backoff = RETRY_MIN;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -37,6 +46,7 @@ fn run(queue: Arc<Queue>, local: PathBuf, remote: PathBuf, stop: Arc<AtomicBool>
         let head = match queue.head() {
             Ok(head) => head,
             Err(err) => {
+                counters.note_error(format!("queue read: {err}"));
                 eprintln!("mirrorfs: queue read failed: {err}");
                 wait(&stop, backoff);
                 backoff = grow(backoff);
@@ -51,11 +61,17 @@ fn run(queue: Arc<Queue>, local: PathBuf, remote: PathBuf, stop: Arc<AtomicBool>
         match apply(&local, &remote, &op) {
             Ok(()) => {
                 if let Err(err) = queue.finish(seq, &op) {
+                    counters.note_error(format!(
+                        "queue ack {seq} op={} path={} result={err}",
+                        op.kind_name(),
+                        op.path().display()
+                    ));
                     eprintln!("mirrorfs: queue ack {seq} failed: {err}");
                     wait(&stop, backoff);
                     backoff = grow(backoff);
                     continue;
                 }
+                counters.note_remote_ok();
                 if debug {
                     eprintln!(
                         "mirrorfs remote op={} path={} result=ok",
@@ -67,6 +83,11 @@ fn run(queue: Arc<Queue>, local: PathBuf, remote: PathBuf, stop: Arc<AtomicBool>
                 backoff = RETRY_MIN;
             }
             Err(err) => {
+                counters.note_remote_retry(format!(
+                    "remote op={} path={} result={err}",
+                    op.kind_name(),
+                    op.path().display()
+                ));
                 eprintln!(
                     "mirrorfs remote op={} path={} result={err} retry",
                     op.kind_name(),

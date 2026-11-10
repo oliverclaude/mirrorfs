@@ -640,7 +640,6 @@ impl Op {
         }
     }
 
-    #[allow(dead_code)] // The virtual sys/queue file prints this.
     pub fn describe(&self) -> String {
         match self {
             Op::Rename { from, to, flags } => {

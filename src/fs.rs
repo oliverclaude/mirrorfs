@@ -13,13 +13,14 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    BsdFileFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::inode::InodeTable;
 use crate::queue::{Create, ObjectKind, Op, Queue, Setattr, WriteData};
+use crate::sysfs::{self, Counters};
 use crate::util::{self, TTL};
 
 pub struct MirrorFs {
@@ -33,6 +34,9 @@ pub struct MirrorFs {
     stripes: Vec<Mutex<()>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    uid: u32,
+    gid: u32,
+    counters: Arc<Counters>,
 }
 
 struct OpenFile {
@@ -54,11 +58,13 @@ impl MirrorFs {
             stripes.push(Mutex::new(()));
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(Counters::new());
         let worker = crate::worker::spawn(
             Arc::clone(&queue),
             local.clone(),
             remote,
             Arc::clone(&stop),
+            Arc::clone(&counters),
             debug,
         )?;
         Ok(Self {
@@ -72,6 +78,9 @@ impl MirrorFs {
             stripes,
             stop,
             worker: Some(worker),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            counters,
         })
     }
 
@@ -124,6 +133,11 @@ impl MirrorFs {
             .push_for_remote(&self.local, op)
             .map(|_| ())
             .map_err(|err| {
+                self.counters.note_error(format!(
+                    "queue op={} path={} result={err}",
+                    op.kind_name(),
+                    op.path().display()
+                ));
                 eprintln!(
                     "mirrorfs: queue append failed for {}: {err}",
                     op.path().display()
@@ -141,6 +155,7 @@ impl MirrorFs {
     }
 
     fn log(&self, op: &str, path: &Path, result: &str, queued: bool) {
+        self.counters.note_fuse(result == "ok");
         util::trace(self.debug, op, path, result, queued);
     }
 
@@ -158,6 +173,10 @@ impl MirrorFs {
         }
         if util::is_queue_name(name) {
             return Err(Errno::ENOENT);
+        }
+        // `<mount>/sys` is the virtual status directory, not a local name.
+        if parent == sysfs::DIR || (parent == 1 && name == OsStr::new(sysfs::NAME)) {
+            return Err(Errno::EROFS);
         }
         let parent_rel = self.rel_of(parent)?;
         Ok(parent_rel.join(name))
@@ -199,6 +218,10 @@ impl Filesystem for MirrorFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         if name == "." {
+            if sysfs::is_reserved(parent) {
+                self.reply_sys_entry("lookup", parent, reply);
+                return;
+            }
             let generation = self.inodes.lock().expect("inode lock").generation(parent);
             self.inodes.lock().expect("inode lock").bump(parent);
             let rel = match self.rel_of(parent) {
@@ -212,6 +235,10 @@ impl Filesystem for MirrorFs {
             return;
         }
         if name == ".." {
+            if parent == sysfs::DIR {
+                self.reply_sys_entry("lookup", 1, reply);
+                return;
+            }
             let (parent_ino, generation) = {
                 let mut inodes = self.inodes.lock().expect("inode lock");
                 let parent_ino = inodes.parent(parent).unwrap_or(1);
@@ -226,6 +253,26 @@ impl Filesystem for MirrorFs {
                 }
             };
             self.reply_entry("lookup", &rel, parent_ino, generation, reply);
+            return;
+        }
+        if sysfs::is_file(parent) {
+            self.trace(
+                "lookup",
+                Path::new(sysfs::rel_of(parent)),
+                &errno_label(Errno::ENOTDIR),
+            );
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+        if parent == sysfs::DIR || (parent == 1 && name == OsStr::new(sysfs::NAME)) {
+            match sysfs::child(parent, name) {
+                Some(ino) => self.reply_sys_entry("lookup", ino, reply),
+                None => {
+                    let shown = Path::new(sysfs::NAME).join(name);
+                    self.trace("lookup", &shown, &errno_label(Errno::ENOENT));
+                    reply.error(Errno::ENOENT);
+                }
+            }
             return;
         }
 
@@ -252,6 +299,9 @@ impl Filesystem for MirrorFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        if sysfs::is_reserved(ino.0) {
+            return;
+        }
         self.inodes
             .lock()
             .expect("inode lock")
@@ -265,6 +315,10 @@ impl Filesystem for MirrorFs {
         _fh: Option<fuser::FileHandle>,
         reply: ReplyAttr,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.reply_sys_attr("getattr", ino.0, reply);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -287,6 +341,15 @@ impl Filesystem for MirrorFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "readlink",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EINVAL),
+            );
+            reply.error(Errno::EINVAL);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -309,6 +372,22 @@ impl Filesystem for MirrorFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if sysfs::is_reserved(ino.0) {
+            let path = Path::new(sysfs::rel_of(ino.0));
+            if !sysfs::is_file(ino.0) || flags.acc_mode() != OpenAccMode::O_RDONLY {
+                let errno = if sysfs::is_file(ino.0) {
+                    Errno::EROFS
+                } else {
+                    Errno::EISDIR
+                };
+                self.trace("open", path, &errno_label(errno));
+                reply.error(errno);
+                return;
+            }
+            self.trace("open", path, "ok");
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -339,7 +418,7 @@ impl Filesystem for MirrorFs {
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -347,6 +426,20 @@ impl Filesystem for MirrorFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        if sysfs::is_file(ino.0) {
+            let bytes = self.sys_bytes(ino.0);
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let end = offset
+                .saturating_add(u64::from(size))
+                .try_into()
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            self.trace("read", Path::new(sysfs::rel_of(ino.0)), "ok");
+            reply.data(&bytes[start..end]);
+            return;
+        }
         let open = {
             let files = self.files.lock().expect("file lock");
             match files.get(&fh.0) {
@@ -408,6 +501,29 @@ impl Filesystem for MirrorFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if ino.0 == sysfs::DIR {
+            let fh = self.alloc_fh();
+            let rel = PathBuf::from(sysfs::NAME);
+            self.dirs.lock().expect("dir lock").insert(
+                fh,
+                OpenDir {
+                    rel: rel.clone(),
+                    entries: self.sys_dir_entries(),
+                },
+            );
+            self.trace("opendir", &rel, "ok");
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+            return;
+        }
+        if sysfs::is_file(ino.0) {
+            self.trace(
+                "opendir",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::ENOTDIR),
+            );
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -450,6 +566,11 @@ impl Filesystem for MirrorFs {
         };
         let Some((rel, entries)) = snapshot else {
             // A zero handle means the kernel did not use our opendir result.
+            if ino.0 == sysfs::DIR {
+                self.trace("readdir", Path::new(sysfs::NAME), "ok");
+                fill_dir(&self.sys_dir_entries(), offset, reply);
+                return;
+            }
             let rel = match self.rel_of(ino.0) {
                 Ok(rel) => rel,
                 Err(errno) => {
@@ -600,7 +721,7 @@ impl Filesystem for MirrorFs {
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -609,6 +730,15 @@ impl Filesystem for MirrorFs {
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "write",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EROFS),
+            );
+            reply.error(Errno::EROFS);
+            return;
+        }
         let open = {
             let files = self.files.lock().expect("file lock");
             match files.get(&fh.0) {
@@ -668,6 +798,15 @@ impl Filesystem for MirrorFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "setattr",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EROFS),
+            );
+            reply.error(Errno::EROFS);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -866,11 +1005,16 @@ impl Filesystem for MirrorFs {
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        if sysfs::is_file(ino.0) {
+            self.trace("fsync", Path::new(sysfs::rel_of(ino.0)), "ok");
+            reply.ok();
+            return;
+        }
         let open = {
             let files = self.files.lock().expect("file lock");
             match files.get(&fh.0) {
@@ -1080,6 +1224,15 @@ impl Filesystem for MirrorFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "link",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EPERM),
+            );
+            reply.error(Errno::EPERM);
+            return;
+        }
         let _stripes = self.lock_all();
         let from = match self.rel_of(ino.0) {
             Ok(rel) => rel,
@@ -1128,6 +1281,15 @@ impl Filesystem for MirrorFs {
         position: u32,
         reply: ReplyEmpty,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "setxattr",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EROFS),
+            );
+            reply.error(Errno::EROFS);
+            return;
+        }
         if position != 0 {
             reply.error(Errno::EINVAL);
             return;
@@ -1170,6 +1332,15 @@ impl Filesystem for MirrorFs {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "getxattr",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::ENODATA),
+            );
+            reply.error(Errno::ENODATA);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -1191,6 +1362,11 @@ impl Filesystem for MirrorFs {
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace("listxattr", Path::new(sysfs::rel_of(ino.0)), "ok");
+            reply_xattr(reply, size, &[]);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -1212,6 +1388,15 @@ impl Filesystem for MirrorFs {
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "removexattr",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EROFS),
+            );
+            reply.error(Errno::EROFS);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -1262,6 +1447,15 @@ impl Filesystem for MirrorFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        if sysfs::is_reserved(ino.0) {
+            self.trace(
+                "fallocate",
+                Path::new(sysfs::rel_of(ino.0)),
+                &errno_label(Errno::EROFS),
+            );
+            reply.error(Errno::EROFS);
+            return;
+        }
         let rel = match self.rel_of(ino.0) {
             Ok(rel) => rel,
             Err(errno) => {
@@ -1459,7 +1653,7 @@ impl MirrorFs {
         for item in dir {
             let item = item.map_err(Errno::from)?;
             let name = item.file_name();
-            if util::is_queue_name(&name) {
+            if util::is_queue_name(&name) || (dir_ino == 1 && name == OsStr::new(sysfs::NAME)) {
                 continue;
             }
             let child_rel = rel.join(&name);
@@ -1473,6 +1667,13 @@ impl MirrorFs {
                 ino: fuse_ino,
                 kind: util::file_kind(st.st_mode),
                 name,
+            });
+        }
+        if dir_ino == 1 {
+            entries.push(DirEntry {
+                ino: sysfs::DIR,
+                kind: FileType::Directory,
+                name: OsString::from(sysfs::NAME),
             });
         }
         Ok(entries)
@@ -1497,6 +1698,96 @@ impl MirrorFs {
         }
         for open in self.dirs.lock().expect("dir lock").values_mut() {
             retarget(&mut open.rel);
+        }
+    }
+
+    fn sys_dir_entries(&self) -> Vec<DirEntry> {
+        vec![
+            DirEntry {
+                ino: sysfs::DIR,
+                kind: FileType::Directory,
+                name: OsString::from("."),
+            },
+            DirEntry {
+                ino: 1,
+                kind: FileType::Directory,
+                name: OsString::from(".."),
+            },
+            DirEntry {
+                ino: sysfs::STATS,
+                kind: FileType::RegularFile,
+                name: OsString::from("stats"),
+            },
+            DirEntry {
+                ino: sysfs::QUEUE,
+                kind: FileType::RegularFile,
+                name: OsString::from("queue"),
+            },
+            DirEntry {
+                ino: sysfs::ERRORS,
+                kind: FileType::RegularFile,
+                name: OsString::from("errors"),
+            },
+        ]
+    }
+
+    fn reply_sys_entry(&self, op: &str, ino: u64, reply: ReplyEntry) {
+        let attr = self.sys_attr(ino);
+        self.trace(op, Path::new(sysfs::rel_of(ino)), "ok");
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    fn reply_sys_attr(&self, op: &str, ino: u64, reply: ReplyAttr) {
+        let attr = self.sys_attr(ino);
+        self.trace(op, Path::new(sysfs::rel_of(ino)), "ok");
+        reply.attr(&TTL, &attr);
+    }
+
+    fn sys_attr(&self, ino: u64) -> FileAttr {
+        let size = self.sys_bytes(ino).len() as u64;
+        let now = SystemTime::now();
+        FileAttr {
+            ino: INodeNo(ino),
+            size,
+            blocks: size.div_ceil(512),
+            atime: now,
+            mtime: now,
+            ctime: self.counters.started_at(),
+            crtime: self.counters.started_at(),
+            kind: if ino == sysfs::DIR {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            },
+            perm: if ino == sysfs::DIR { 0o555 } else { 0o444 },
+            nlink: if ino == sysfs::DIR { 2 } else { 1 },
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
+    fn sys_bytes(&self, ino: u64) -> Vec<u8> {
+        match ino {
+            sysfs::STATS => {
+                let depth = self
+                    .queue
+                    .pending()
+                    .map(|records| records.len())
+                    .unwrap_or(0);
+                self.counters.render_stats(depth as u64)
+            }
+            sysfs::QUEUE => match self.queue.pending() {
+                Ok(records) => sysfs::render_queue(&records),
+                Err(err) => {
+                    self.counters.note_error(format!("queue list: {err}"));
+                    format!("queue list failed: {err}\n").into_bytes()
+                }
+            },
+            sysfs::ERRORS => self.counters.render_errors(),
+            _ => Vec::new(),
         }
     }
 }

@@ -1,6 +1,7 @@
 mod fs;
 mod inode;
 mod queue;
+mod sysfs;
 mod util;
 mod worker;
 
