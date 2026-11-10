@@ -1,0 +1,196 @@
+.TH FUSE.MIRRORFS 8 "November 2026" "mirrorfs 0.1.0" "System Manager's Manual"
+.SH NAME
+fuse.mirrorfs \- mount mirrorfs from /etc/fstab
+.SH SYNOPSIS
+.SY mount
+.B \-t fuse.mirrorfs
+.I local mountpoint
+.B \-o
+.I remote=path\fR[\fI,option\fR...]
+.YS
+.SH DESCRIPTION
+An
+.B /etc/fstab
+entry of type
+.B fuse.mirrorfs
+is mounted by
+.BR mount.fuse3 (8).
+That helper executes the
+.B mirrorfs
+program, which the Debian package installs at
+.IR /usr/bin/mirrorfs .
+The boot
+.B PATH
+includes
+.IR /usr/bin ,
+so the entry does not need a full path to the binary.
+.PP
+.B mount.fuse3
+calls
+.B mirrorfs
+with the local directory, the mount point, and a single
+.B \-o
+list.
+Without the
+.B foreground
+option,
+.B mirrorfs
+forks.
+The parent exits 0 after the mount is ready, and the child keeps serving.
+Putting
+.B foreground
+in fstab makes
+.BR mount (8)
+wait until the filesystem is unmounted, which stalls boot.
+.PP
+The local directory is the only source of truth.
+Mutations are applied there first and then replayed onto
+.IR remote= .
+Reads never fall back to the remote directory.
+See
+.BR mirrorfs (1)
+for the foreground command and the queue.
+.SH FSTAB
+.EX
+/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local,x-systemd.requires-mounts-for=/mnt/claude_remote  0  0
+.EE
+.PP
+The first field is the local directory.
+.I remote=
+is required and is the directory that receives the mirror.
+The fifth and sixth fields are dump and pass, both 0.
+.PP
+.B _netdev
+and a repeated
+.BI x-systemd.requires-mounts-for= path
+ask systemd to mount the local directory and the remote directory first.
+The remote path in the example is an NFS mount, so
+.B _netdev
+waits for the network as well.
+.B nofail
+lets boot continue when
+.B mirrorfs
+fails.
+.B nodev
+and
+.B nosuid
+are forwarded to the kernel.
+A path that contains a comma cannot be written in this option list.
+.PP
+Unmount with
+.B umount
+.I mountpoint
+or
+.B fusermount3 \-u
+.IR mountpoint .
+.SH OPTIONS
+Options
+.B mount.fuse3
+strips before
+.B mirrorfs
+sees them
+.RB ( user ,
+.BR users ,
+.BR nouser ,
+.BR nofail ,
+.BR auto ,
+.BR noauto ,
+.BR _netdev ,
+.BR setuid= ,
+.BR drop_privileges )
+are still accepted when
+.B mirrorfs
+is invoked directly.
+So are
+.BR defaults ,
+.BR comment ,
+.BI comment= text\fR,
+and any option whose name starts with
+.BR x- .
+.TP
+.BI remote= path
+Remote directory.
+Required.
+The path must already be a directory, and it must not be the local directory or the mount point.
+.TP
+.B allow_other
+Let every user access the filesystem.
+As root this does not need
+.I user_allow_other
+in
+.IR /etc/fuse.conf .
+The kernel still enforces
+.BR default_permissions ,
+which
+.B mirrorfs
+always sets.
+.TP
+.B allow_root
+Let root access the filesystem in addition to the mounter.
+Ignored when
+.B allow_other
+is also set.
+.TP
+.B debug
+Append one line per operation to the daemon log.
+.TP
+.B foreground
+Stay in the foreground and log to the terminal.
+For a manual run.
+Do not use it in
+.IR /etc/fstab .
+.TP
+.B ro
+Mount read-only.
+The kernel rejects writes, so nothing new is queued.
+.TP
+.BR rw ", " exec ", " noexec ", " suid ", " nosuid ", " dev ", " nodev
+.TQ
+.BR atime ", " noatime ", " relatime ", " strictatime ", " lazytime
+.TQ
+.BR sync ", " async ", " dirsync
+Passed through to the FUSE mount.
+.B nodev
+and
+.B nosuid
+belong on a normal fstab line.
+.B mount.fuse3
+adds
+.B dev
+and
+.B suid
+when those two were not requested.
+.TP
+.B default_permissions
+Accepted and ignored.
+.B mirrorfs
+always enables it.
+.TP
+.B auto_unmount
+Rejected.
+The daemon outlives the
+.B mount
+command, so this option would not mean what it means for a foreground FUSE process.
+.PP
+Any other option is an error and the mount does not proceed.
+.SH FILES
+.TP
+.I /usr/bin/mirrorfs
+Installed filesystem daemon.
+.TP
+.I /var/log/mirrorfs.log
+Log written by a daemonized mount, mode 0644, created on first use.
+If it cannot be opened, messages are discarded.
+The foreground command logs to the terminal instead.
+.TP
+.I /etc/fstab
+Mount table read by
+.BR mount (8)
+and by systemd.
+.SH SEE ALSO
+.BR mirrorfs (1),
+.BR mount (8),
+.BR mount.fuse3 (8),
+.BR fusermount3 (1),
+.BR fstab (5),
+.BR systemd.mount (5)

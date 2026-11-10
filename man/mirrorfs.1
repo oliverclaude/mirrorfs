@@ -1,0 +1,115 @@
+.TH MIRRORFS 1 "November 2026" "mirrorfs 0.1.0" "User Commands"
+.SH NAME
+mirrorfs \- mirror local filesystem mutations onto a remote directory
+.SH SYNOPSIS
+.SY mirrorfs
+.B \-\-local
+.I path
+.B \-\-remote
+.I path
+.RB [ \-\-debug ]
+.RB [ \-\-allow-other ]
+.I mountpoint
+.YS
+.SY mirrorfs
+.I local
+.I mountpoint
+.B \-o
+.I remote=path\fR[\fI,option\fR...]
+.YS
+.SH DESCRIPTION
+.B mirrorfs
+is a FUSE filesystem.
+The local directory is the only source of truth.
+A mutation is applied there and the call returns.
+One background thread then replays a persistent queue onto the remote directory.
+Reads never consult the remote.
+.PP
+The first form stays in the foreground and writes its log to the terminal.
+Stop it with
+.B SIGINT
+or
+.BR SIGTERM ,
+or run
+.BR "fusermount3 \-u" .
+.PP
+The second form is what
+.BR mount (8)
+uses for an
+.B /etc/fstab
+entry of type
+.BR fuse.mirrorfs .
+It is described in
+.BR fuse.mirrorfs (8).
+Without
+.BR foreground ,
+that form forks into the background after the mount is ready.
+Its log goes to
+.IR /var/log/mirrorfs.log .
+.SH OPTIONS
+.TP
+.BI \-\-local " path"
+Local directory.
+Reads and the accepted state come from here.
+.TP
+.BI \-\-remote " path"
+Directory that receives the asynchronous mirror, typically an NFS mount.
+.TP
+.BR \-d ", " \-\-debug
+Log every operation: path, name, result, and whether it was queued.
+.TP
+.B \-\-allow\-other
+Let users other than the mounter access the filesystem.
+The kernel still checks each file's mode, owner, and group.
+Mounting as root does not need
+.I user_allow_other
+in
+.IR /etc/fuse.conf .
+Mounting as a non-root user does.
+.TP
+.I mountpoint
+Existing directory to mount on.
+It must differ from both the local directory and the remote directory.
+.PP
+In the
+.B \-o
+form, the local directory and the mount point are the two positional
+arguments, and the remote directory is the
+.BI remote= path
+option.
+That form also accepts
+.BR allow_other ,
+.BR allow_root ,
+.BR debug ,
+and
+.BR foreground ,
+plus the VFS flags listed in
+.BR fuse.mirrorfs (8).
+.SH FILES
+.TP
+.I <local>/.mirrorfs\-queue/
+Persistent queue of operations waiting for the remote directory.
+The directory is hidden from the mount.
+.TP
+.I <mount>/sys/stats
+.TQ
+.I <mount>/sys/queue
+.TQ
+.I <mount>/sys/errors
+Userspace status files.
+They are not kernel sysfs entries.
+The directory is mode 0555 and the files are mode 0444.
+.TP
+.I /var/log/mirrorfs.log
+Log for a daemonized mount.
+If the file cannot be opened, the log is discarded.
+.SH EXIT STATUS
+.B 0
+on a clean unmount, or when a daemonized parent has seen the mount succeed.
+.B 1
+when the arguments, a directory, or the mount itself is rejected.
+.SH SEE ALSO
+.BR fuse.mirrorfs (8),
+.BR mount (8),
+.BR mount.fuse3 (8),
+.BR fusermount3 (1)

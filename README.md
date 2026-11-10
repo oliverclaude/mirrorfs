@@ -103,8 +103,10 @@ The binary is `target/release/mirrorfs`. It is dynamically linked against
 ### Debian package
 
 `packaging/build-deb.sh` builds the release binary and packs it as
-`dist/mirrorfs_<version>-1_<arch>.deb`. The package version follows
-`Cargo.toml` (currently `0.1.0-1`). Library dependencies are filled in by
+`dist/mirrorfs_<version>-2_<arch>.deb`. The package version follows
+`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-2`).
+The package installs `/usr/bin/mirrorfs`, `man mirrorfs`, and
+`man fuse.mirrorfs`. Library dependencies are filled in by
 `dpkg-shlibdeps`. `fuse3` is added as well, because `fusermount3` is executed
 by name and is not a shared library.
 
@@ -121,14 +123,14 @@ MIRRORFS_CARGO_OFFLINE=1 packaging/build-deb.sh
 Install it on another machine with apt so the dependencies are pulled in:
 
 ```sh
-sudo apt-get install ./dist/mirrorfs_0.1.0-1_amd64.deb
+sudo apt-get install ./dist/mirrorfs_0.1.0-2_amd64.deb
 ```
 
 `dpkg -i` does not install dependencies. Install them first, then the package:
 
 ```sh
 sudo apt-get install fuse3 'libc6 (>= 2.39)' libgcc-s1
-sudo dpkg -i mirrorfs_0.1.0-1_amd64.deb
+sudo dpkg -i mirrorfs_0.1.0-2_amd64.deb
 ```
 
 The `.deb` built here is amd64 and needs glibc 2.39 or newer (`GLIBC_2.39`).
@@ -164,14 +166,47 @@ mirrorfs --local /mnt/claude_local --remote /mnt/claude_remote /mnt/claude
 | `--allow-other` | Pass FUSE `allow_other`. |
 | `MOUNTPOINT` | Existing empty directory to mount on. |
 
-The process stays in the foreground. Unmount with `fusermount3 -u MOUNTPOINT`,
-or send `SIGINT` / `SIGTERM`.
+This form stays in the foreground and logs to the terminal. Unmount with
+`fusermount3 -u MOUNTPOINT`, or send `SIGINT` / `SIGTERM`.
 
 `--debug` writes lines like:
 
 ```text
 mirrorfs op=write path=notes.txt result=ok queued=yes
 ```
+
+### Mounting from /etc/fstab
+
+With the package installed, `/usr/bin/mirrorfs` is on the default `PATH`.
+`mount -t fuse.mirrorfs` runs `mount.fuse3`, which executes `mirrorfs` with
+the local directory, the mount point, and `-o`. That form daemonizes: the
+parent waits until the mount exists, then exits, so boot does not stay
+blocked on the filesystem. Do not put `foreground` in fstab. That option
+keeps the process in the foreground and `mount` would wait forever.
+
+```fstab
+/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local,x-systemd.requires-mounts-for=/mnt/claude_remote  0  0
+```
+
+The first field is the local directory. `remote=` is the directory that
+receives the mirror. `allow_other` lets other accounts use the mount. As
+root, that does not need `user_allow_other` in `/etc/fuse.conf`. `nodev` and
+`nosuid` are passed through to the kernel. `_netdev` and
+`x-systemd.requires-mounts-for=` make systemd mount the local directory and
+the NFS remote first. `nofail` lets boot continue when this mount fails.
+Paths cannot contain a comma, because mount options are comma-separated.
+
+The same line by hand:
+
+```sh
+sudo mount -t fuse.mirrorfs /mnt/claude_local /mnt/claude -o remote=/mnt/claude_remote,allow_other,nodev,nosuid
+```
+
+Unmount with `umount /mnt/claude` or `fusermount3 -u /mnt/claude`. The
+daemon logs to `/var/log/mirrorfs.log`. If that file cannot be opened, the
+log is discarded. `debug` on the option list writes one line per operation
+there. `man mirrorfs` and `man fuse.mirrorfs` describe the command and this
+fstab line. `auto_unmount` is rejected.
 
 ### Mounting as root for other users
 

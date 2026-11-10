@@ -6,7 +6,7 @@ umask 022
 
 cd "$(dirname "$0")/.."
 
-for tool in cargo dpkg dpkg-deb dpkg-shlibdeps install du; do
+for tool in cargo dpkg dpkg-deb dpkg-shlibdeps install du gzip; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "mirrorfs: $tool is required to build the package" >&2
         exit 1
@@ -18,7 +18,7 @@ if [ -z "$version" ]; then
     echo "mirrorfs: version missing from Cargo.toml" >&2
     exit 1
 fi
-revision=1
+revision=2
 arch=$(dpkg --print-architecture)
 pkgver="${version}-${revision}"
 debname="mirrorfs_${pkgver}_${arch}.deb"
@@ -38,9 +38,15 @@ cleanup() {
 trap cleanup EXIT
 chmod 0755 "$stage"
 
-mkdir -p "$stage/usr/bin" "$stage/usr/share/doc/mirrorfs" "$stage/DEBIAN"
+mkdir -p "$stage/usr/bin" "$stage/usr/share/doc/mirrorfs" \
+    "$stage/usr/share/man/man1" "$stage/usr/share/man/man8" "$stage/DEBIAN"
 install -m 0755 target/release/mirrorfs "$stage/usr/bin/mirrorfs"
 install -m 0644 README.md "$stage/usr/share/doc/mirrorfs/README.md"
+gzip -n -c man/mirrorfs.1 > "$stage/usr/share/man/man1/mirrorfs.1.gz"
+gzip -n -c man/fuse.mirrorfs.8 > "$stage/usr/share/man/man8/fuse.mirrorfs.8.gz"
+chmod 0644 "$stage/usr/share/man/man1/mirrorfs.1.gz" \
+    "$stage/usr/share/man/man8/fuse.mirrorfs.8.gz"
+ln -s fuse.mirrorfs.8.gz "$stage/usr/share/man/man8/mount.fuse.mirrorfs.8.gz"
 cat > "$stage/usr/share/doc/mirrorfs/copyright" << 'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: mirrorfs
