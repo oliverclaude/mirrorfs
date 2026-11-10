@@ -103,8 +103,8 @@ The binary is `target/release/mirrorfs`. It is dynamically linked against
 ### Debian package
 
 `packaging/build-deb.sh` builds the release binary and packs it as
-`dist/mirrorfs_<version>-3_<arch>.deb`. The package version follows
-`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-3`).
+`dist/mirrorfs_<version>-4_<arch>.deb`. The package version follows
+`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-4`).
 The package installs `/usr/bin/mirrorfs`, `man mirrorfs`, and
 `man fuse.mirrorfs`. Library dependencies are filled in by
 `dpkg-shlibdeps`. `fuse3` is added as well, because `fusermount3` is executed
@@ -123,14 +123,14 @@ MIRRORFS_CARGO_OFFLINE=1 packaging/build-deb.sh
 Install it on another machine with apt so the dependencies are pulled in:
 
 ```sh
-sudo apt-get install ./dist/mirrorfs_0.1.0-3_amd64.deb
+sudo apt-get install ./dist/mirrorfs_0.1.0-4_amd64.deb
 ```
 
 `dpkg -i` does not install dependencies. Install them first, then the package:
 
 ```sh
 sudo apt-get install fuse3 'libc6 (>= 2.39)' libgcc-s1
-sudo dpkg -i mirrorfs_0.1.0-3_amd64.deb
+sudo dpkg -i mirrorfs_0.1.0-4_amd64.deb
 ```
 
 The `.deb` built here is amd64 and needs glibc 2.39 or newer (`GLIBC_2.39`).
@@ -161,7 +161,9 @@ mirrorfs --local /mnt/claude_local --remote /mnt/claude_remote /mnt/claude
 | Option | Meaning |
 | --- | --- |
 | `--local PATH` | Local directory. Reads and the accepted state come from here. |
-| `--remote PATH` | Directory that receives the asynchronous mirror, typically NFS. |
+| `--remote PATH` | Directory that receives the asynchronous mirror. It can be the root of a mount or a folder inside one. |
+| `--remote-fs TYPE` | Kernel filesystem type that directory must be on, such as `nfs`, `cifs`, or `ceph`. `nfs` also matches `nfs4`. Repeat the flag, or join types with `:`. |
+| `--remote-check DURATION` | How often to look for `--remote-fs` while it is absent. `30s`, `5m`, `1h`. Default `5m`. Requires `--remote-fs`. |
 | `--debug`, `-d` | Log every operation: path, name, result, and whether it was queued. |
 | `--allow-other` | Pass FUSE `allow_other`. |
 | `MOUNTPOINT` | Existing empty directory to mount on. |
@@ -185,21 +187,43 @@ blocked on the filesystem. Do not put `foreground` in fstab. That option
 keeps the process in the foreground and `mount` would wait forever.
 
 ```fstab
-/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local,x-systemd.requires-mounts-for=/mnt/claude_remote  0  0
+/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,remote-fs=nfs,remote-check=5m,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local  0  0
 ```
 
 The first field is the local directory. `remote=` is the directory that
-receives the mirror. `allow_other` lets other accounts use the mount. As
-root, that does not need `user_allow_other` in `/etc/fuse.conf`. `nodev` and
-`nosuid` are passed through to the kernel. `_netdev` and
-`x-systemd.requires-mounts-for=` make systemd mount the local directory and
-the NFS remote first. `nofail` lets boot continue when this mount fails.
-Paths cannot contain a comma, because mount options are comma-separated.
+receives the mirror. It can be the mount root or a folder inside that mount.
+`remote-fs=nfs` accepts a kernel type of `nfs` or `nfs4`. Until the path is
+on that filesystem, mirrorfs stays mounted, queues mutations, and does not
+copy them onto the local directory underneath the mountpoint. A check thread
+looks again every `remote-check` interval (default 5 minutes) and drains the
+queue once the type matches. Copies then go through a directory fd held on
+that mount, so a later unmount cannot redirect them onto the local disk.
+
+Leave `x-systemd.requires-mounts-for=` off the remote path. With it, systemd
+does not start mirrorfs when the NFS mount has failed. Keep it for the local
+directory. `allow_other` lets other accounts use the mount. As root, that
+does not need `user_allow_other` in `/etc/fuse.conf`. `nodev` and `nosuid`
+are passed through to the kernel. `_netdev` orders the mount after the
+network. `nofail` lets boot continue when this mount fails. Paths cannot
+contain a comma, because mount options are comma-separated. The type seen by
+`remote-fs` is the one `findmnt -n -o FSTYPE` prints. `cifs` is the kernel
+name of an SMB mount, and `ceph` is the kernel Ceph client.
 
 The same line by hand:
 
 ```sh
-sudo mount -t fuse.mirrorfs /mnt/claude_local /mnt/claude -o remote=/mnt/claude_remote,allow_other,nodev,nosuid
+sudo mount -t fuse.mirrorfs /mnt/claude_local /mnt/claude -o remote=/mnt/claude_remote,remote-fs=nfs,remote-check=5m,allow_other,nodev,nosuid
+```
+
+A folder inside each mount, rather than the mount roots:
+
+```sh
+mirrorfs \
+  --local /mnt/claude_local/projects \
+  --remote /mnt/claude_remote/projects \
+  --remote-fs nfs \
+  --remote-check 5m \
+  /mnt/projects
 ```
 
 Unmount with `umount /mnt/claude` or `fusermount3 -u /mnt/claude`. The

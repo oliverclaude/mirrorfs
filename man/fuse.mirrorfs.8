@@ -52,21 +52,28 @@ See
 for the foreground command and the queue.
 .SH FSTAB
 .EX
-/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local,x-systemd.requires-mounts-for=/mnt/claude_remote  0  0
+/mnt/claude_local  /mnt/claude  fuse.mirrorfs  remote=/mnt/claude_remote,remote-fs=nfs,remote-check=5m,allow_other,nodev,nosuid,_netdev,nofail,x-systemd.requires-mounts-for=/mnt/claude_local  0  0
 .EE
 .PP
 The first field is the local directory.
 .I remote=
 is required and is the directory that receives the mirror.
+That directory can be the mount root or a folder inside the mount.
 The fifth and sixth fields are dump and pass, both 0.
 .PP
+.B remote-fs=nfs
+keeps mirrorfs mounted when that path is not NFS yet.
+Mutations stay queued until a check thread sees
+.B nfs
+or
+.BR nfs4 .
+Do not put
+.BI x-systemd.requires-mounts-for=
+on the remote path: systemd would then refuse to start mirrorfs after the
+NFS mount failed.
+Keep that requirement for the local directory.
 .B _netdev
-and a repeated
-.BI x-systemd.requires-mounts-for= path
-ask systemd to mount the local directory and the remote directory first.
-The remote path in the example is an NFS mount, so
-.B _netdev
-waits for the network as well.
+orders this mount after the network.
 .B nofail
 lets boot continue when
 .B mirrorfs
@@ -112,6 +119,41 @@ and any option whose name starts with
 Remote directory.
 Required.
 The path must already be a directory, and it must not be the local directory or the mount point.
+A folder inside an NFS, SMB, or Ceph mount is accepted, as is the mount root.
+.TP
+.BI remote\-fs= type
+Kernel filesystem type
+.I path
+must be on.
+The name is what
+.B findmnt \-n \-o FSTYPE
+prints, such as
+.BR nfs4 ,
+.BR cifs ,
+or
+.BR ceph .
+.B nfs
+also matches
+.BR nfs4 .
+Several types can be joined with
+.B :
+or by repeating the option.
+While the path is a different filesystem, mirrorfs queues mutations and does
+not write through that path.
+.TP
+.BI remote\-check= duration
+How often to look for
+.BR remote\-fs .
+.BR 30s ,
+.BR 5m ,
+.BR 1h ,
+or a number of seconds.
+The default is
+.BR 5m .
+The first look is immediate.
+A match opens a directory fd on that mount and drains the queue through it.
+Requires
+.BR remote\-fs .
 .TP
 .B allow_other
 Let every user access the filesystem.

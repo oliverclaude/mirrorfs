@@ -53,7 +53,40 @@ Local directory.
 Reads and the accepted state come from here.
 .TP
 .BI \-\-remote " path"
-Directory that receives the asynchronous mirror, typically an NFS mount.
+Directory that receives the asynchronous mirror.
+It can be the root of a mount or a folder inside one.
+.TP
+.BI \-\-remote\-fs " type"
+Kernel filesystem type that directory must be on, as printed by
+.BR "findmnt \-n \-o FSTYPE" .
+Examples:
+.BR nfs ,
+.BR cifs ,
+.BR ceph .
+.B nfs
+also matches the kernel type
+.BR nfs4 .
+Repeat this option, or join several types with
+.BR : .
+Until the path is on one of those types, mirrorfs stays mounted and queues
+mutations. It does not copy them onto the local directory that appears at
+the path while the remote filesystem is absent.
+.TP
+.BI \-\-remote\-check " duration"
+How often to look for
+.B \-\-remote\-fs
+while it is absent.
+.BR 30s ,
+.BR 5m ,
+.BR 1h ,
+or a bare number of seconds.
+The default is
+.BR 5m .
+The first look happens at startup.
+When the type matches, the queue is drained through a directory fd held on
+that filesystem.
+This option requires
+.BR \-\-remote\-fs .
 .TP
 .BR \-d ", " \-\-debug
 Log every operation: path, name, result, and whether it was queued.
@@ -81,8 +114,10 @@ That form also accepts
 .BR allow_other ,
 .BR allow_root ,
 .BR debug ,
-and
 .BR foreground ,
+.BI remote\-fs= type\fR,
+and
+.BI remote\-check= duration\fR,
 plus the VFS flags listed in
 .BR fuse.mirrorfs (8).
 .SH FILES

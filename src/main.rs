@@ -1,6 +1,7 @@
 mod fs;
 mod inode;
 mod queue;
+mod remote_pin;
 mod sysfs;
 mod util;
 mod worker;
@@ -40,6 +41,17 @@ struct Args {
     #[arg(long)]
     allow_other: bool,
 
+    /// Kernel filesystem type `remote` must be on, such as `nfs` or `cifs`.
+    /// Repeat the flag, or separate several types with `:`.
+    /// `nfs` also matches the kernel type `nfs4`.
+    #[arg(long = "remote-fs", value_name = "TYPE")]
+    remote_fs: Vec<String>,
+
+    /// How often to look for `remote-fs` while the remote filesystem is absent.
+    /// Examples: `30s`, `5m`, `1h`. The default is 5 minutes.
+    #[arg(long = "remote-check", value_name = "DURATION")]
+    remote_check: Option<String>,
+
     /// Directory to mount on.
     mountpoint: PathBuf,
 }
@@ -53,6 +65,8 @@ struct Launch {
     allow_other: bool,
     allow_root: bool,
     foreground: bool,
+    remote_fs: Vec<String>,
+    remote_check: Option<String>,
     /// VFS flags from `-o`, forwarded to fusermount3. `nodev` and `nosuid`
     /// must be forwarded: dropping them leaves a root mount able to honor
     /// device nodes and set-id bits.
@@ -95,6 +109,8 @@ fn main() -> ExitCode {
             allow_other: args.allow_other,
             allow_root: false,
             foreground: true,
+            remote_fs: args.remote_fs,
+            remote_check: args.remote_check,
             kernel_options: Vec::new(),
         },
         None,
@@ -114,7 +130,39 @@ fn serve(mut launch: Launch, ready: Option<libc::c_int>) -> ExitCode {
     let mountpoint = paths.mountpoint.clone();
     spawn_unmount_on_signal(mountpoint.clone());
 
-    let fs = match fs::MirrorFs::new(paths.local.clone(), paths.remote.clone(), launch.debug) {
+    let watch = match remote_pin::watch(
+        match remote_pin::split_fs_types(&launch.remote_fs) {
+            Ok(types) => types,
+            Err(err) => {
+                eprintln!("mirrorfs: {err}");
+                return ExitCode::from(1);
+            }
+        },
+        match launch
+            .remote_check
+            .as_deref()
+            .map(remote_pin::parse_check_interval)
+        {
+            None => None,
+            Some(Ok(interval)) => Some(interval),
+            Some(Err(err)) => {
+                eprintln!("mirrorfs: {err}");
+                return ExitCode::from(1);
+            }
+        },
+    ) {
+        Ok(watch) => watch,
+        Err(err) => {
+            eprintln!("mirrorfs: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let fs = match fs::MirrorFs::new(
+        paths.local.clone(),
+        paths.remote.clone(),
+        launch.debug,
+        watch,
+    ) {
         Ok(fs) => fs,
         Err(err) => {
             eprintln!("mirrorfs: local {}: {err}", paths.local.display());
@@ -151,13 +199,18 @@ fn serve(mut launch: Launch, ready: Option<libc::c_int>) -> ExitCode {
     }
     notify_ready(ready);
     eprintln!(
-        "mirrorfs: mounted {} local={} remote={} debug={} allow_other={} allow_root={}",
+        "mirrorfs: mounted {} local={} remote={} debug={} allow_other={} allow_root={} remote_fs={}",
         mountpoint.display(),
         paths.local.display(),
         paths.remote.display(),
         launch.debug,
         launch.allow_other,
-        launch.allow_root
+        launch.allow_root,
+        if launch.remote_fs.is_empty() {
+            "-".to_string()
+        } else {
+            launch.remote_fs.join(":")
+        }
     );
     match session.run() {
         Ok(()) => {
@@ -298,6 +351,8 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
     let mut allow_other = false;
     let mut allow_root = false;
     let mut foreground = false;
+    let mut remote_fs = Vec::new();
+    let mut remote_check = None;
     let mut kernel_options = Vec::new();
     for opt in options {
         if opt.is_empty() || ignored_mount_option(&opt) || opt == "default_permissions" {
@@ -319,6 +374,16 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
             debug = true;
         } else if opt == "foreground" {
             foreground = true;
+        } else if let Some(value) = opt.strip_prefix("remote-fs=") {
+            remote_fs.push(value.to_string());
+        } else if let Some(value) = opt.strip_prefix("remote-check=") {
+            if remote_check.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "remote-check is set more than once",
+                ));
+            }
+            remote_check = Some(value.to_string());
         } else if opt == "auto_unmount" {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -339,6 +404,11 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
             "mount options must include remote=PATH",
         ));
     };
+    let check = match remote_check.as_deref() {
+        Some(value) => Some(remote_pin::parse_check_interval(value)?),
+        None => None,
+    };
+    remote_pin::watch(remote_pin::split_fs_types(&remote_fs)?, check)?;
     Ok(Launch {
         local: PathBuf::from(&positionals[0]),
         remote,
@@ -347,6 +417,8 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
         allow_other,
         allow_root,
         foreground,
+        remote_fs,
+        remote_check,
         kernel_options,
     })
 }
@@ -589,6 +661,33 @@ mod tests {
         let err = fuse_launch(&owned).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("subdir="));
+    }
+
+    #[test]
+    fn fstab_remote_fs_accepts_a_list_and_an_interval() {
+        let got = launch(&[
+            "/data/local",
+            "/mnt/mirror",
+            "-o",
+            "remote=/data/remote,remote-fs=nfs:cifs,remote-check=30s",
+        ]);
+        assert_eq!(got.remote_fs, vec!["nfs:cifs".to_string()]);
+        assert_eq!(got.remote_check.as_deref(), Some("30s"));
+        let types = super::remote_pin::split_fs_types(&got.remote_fs).unwrap();
+        assert_eq!(types, vec!["nfs".to_string(), "cifs".to_string()]);
+    }
+
+    #[test]
+    fn fstab_remote_check_requires_a_filesystem_type() {
+        let owned = vec![
+            "/mnt/claude_local".to_string(),
+            "/mnt/claude".to_string(),
+            "-o".to_string(),
+            "remote=/mnt/claude_remote,remote-check=5m".to_string(),
+        ];
+        let err = fuse_launch(&owned).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("remote-check"));
     }
 
     #[test]

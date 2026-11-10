@@ -6,11 +6,12 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::queue::{Create, ObjectKind, Op, Queue, Setattr, Snapshot, WriteData};
+use crate::remote_pin::{self, RemoteWatch};
 use crate::sysfs::Counters;
 use crate::util;
 
@@ -24,10 +25,265 @@ pub fn spawn(
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
     debug: bool,
+    watch: Option<RemoteWatch>,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("mirrorfs-remote".to_string())
-        .spawn(move || run(queue, local, remote, stop, counters, debug))
+        .spawn(move || {
+            if let Some(watch) = watch {
+                run_watched(queue, local, remote, stop, counters, debug, watch);
+            } else {
+                run(queue, local, remote, stop, counters, debug);
+            }
+        })
+}
+
+struct Pin {
+    // Held so the descriptor in `root` stays open for the life of the pin.
+    _file: File,
+    root: PathBuf,
+}
+
+struct Gate {
+    pin: Mutex<Option<Pin>>,
+    ready: Condvar,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            pin: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn current(&self) -> Option<PathBuf> {
+        self.pin
+            .lock()
+            .expect("remote pin")
+            .as_ref()
+            .map(|pin| pin.root.clone())
+    }
+
+    fn publish(&self, file: File) {
+        let root = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        *self.pin.lock().expect("remote pin") = Some(Pin { _file: file, root });
+        self.ready.notify_all();
+    }
+
+    fn clear(&self) {
+        *self.pin.lock().expect("remote pin") = None;
+    }
+
+    fn wait_for_pin(&self, stop: &AtomicBool) -> Option<PathBuf> {
+        let mut guard = self.pin.lock().expect("remote pin");
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(pin) = guard.as_ref() {
+                return Some(pin.root.clone());
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(guard, Duration::from_millis(50))
+                .expect("remote pin");
+            guard = next;
+        }
+    }
+}
+
+fn run_watched(
+    queue: Arc<Queue>,
+    local: PathBuf,
+    remote: PathBuf,
+    stop: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+    debug: bool,
+    watch: RemoteWatch,
+) {
+    let gate = Arc::new(Gate::new());
+    let probe_gate = Arc::clone(&gate);
+    let probe_stop = Arc::clone(&stop);
+    let probe_remote = remote.clone();
+    let probe = thread::Builder::new()
+        .name("mirrorfs-remote-check".to_string())
+        .spawn(move || probe_loop(&probe_remote, watch, &probe_stop, &probe_gate))
+        .expect("spawn remote check");
+    let mut backoff = RETRY_MIN;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(remote_root) = gate.wait_for_pin(&stop) else {
+            break;
+        };
+        let head = match queue.head() {
+            Ok(head) => head,
+            Err(err) => {
+                counters.note_error(format!("queue read: {err}"));
+                eprintln!("mirrorfs: queue read failed: {err}");
+                wait(&stop, backoff);
+                backoff = grow(backoff);
+                continue;
+            }
+        };
+        let Some((seq, op)) = head else {
+            backoff = RETRY_MIN;
+            wait(&stop, RETRY_MIN);
+            continue;
+        };
+        let recovered = match apply(&local, &remote_root, &op) {
+            Ok(()) => None,
+            Err(err) => {
+                if stop.load(Ordering::Relaxed) {
+                    log_retry(&op, &err);
+                    break;
+                }
+                if remote_lost(&err) || !mount_available(&remote_root) {
+                    note_lost(&counters, &op, &err);
+                    gate.clear();
+                    continue;
+                }
+                match repair(&local, &remote_root, &op, &err) {
+                    Repair::Done => Some(err),
+                    Repair::Unchanged => {
+                        if !mount_available(&remote_root) {
+                            note_lost(&counters, &op, &err);
+                            gate.clear();
+                            continue;
+                        }
+                        log_retry(&op, &err);
+                        counters.note_remote_retry(retry_message(&op, &err));
+                        wait(&stop, backoff);
+                        backoff = grow(backoff);
+                        continue;
+                    }
+                    Repair::Failed(fix_err) => {
+                        if remote_lost(&fix_err) || !mount_available(&remote_root) {
+                            note_lost(&counters, &op, &fix_err);
+                            gate.clear();
+                            continue;
+                        }
+                        log_retry(&op, &fix_err);
+                        counters.note_remote_retry(retry_message(&op, &fix_err));
+                        wait(&stop, backoff);
+                        backoff = grow(backoff);
+                        continue;
+                    }
+                }
+            }
+        };
+        if let Err(err) = queue.finish(seq, &op) {
+            counters.note_error(format!(
+                "queue ack {seq} op={} path={} result={err}",
+                op.kind_name(),
+                op.path().display()
+            ));
+            eprintln!("mirrorfs: queue ack {seq} failed: {err}");
+            wait(&stop, backoff);
+            backoff = grow(backoff);
+            continue;
+        }
+        counters.note_remote_ok();
+        if debug {
+            eprintln!(
+                "mirrorfs remote op={} path={} result=ok",
+                op.kind_name(),
+                op.path().display()
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        if let Some(err) = recovered {
+            counters.note_error(format!(
+                "remote op={} path={} result={err} recovered",
+                op.kind_name(),
+                op.path().display()
+            ));
+        }
+        backoff = RETRY_MIN;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = probe.join();
+}
+
+fn note_lost(counters: &Counters, op: &Op, err: &io::Error) {
+    eprintln!(
+        "mirrorfs: remote mount lost op={} path={} result={err}",
+        op.kind_name(),
+        op.path().display()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    counters.note_remote_retry(retry_message(op, err));
+}
+
+fn probe_loop(remote: &Path, watch: RemoteWatch, stop: &AtomicBool, gate: &Gate) {
+    let mut reported = String::new();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if gate.current().is_none() {
+            match remote_pin::pin_if_match(remote, &watch.fs_types) {
+                Ok(Some(file)) => {
+                    let found =
+                        remote_pin::fstype_of(remote).unwrap_or_else(|_| "online".to_string());
+                    eprintln!(
+                        "mirrorfs: remote {} is {found}, draining the queue",
+                        remote.display()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    gate.publish(file);
+                    reported.clear();
+                }
+                Ok(None) => {
+                    let found =
+                        remote_pin::fstype_of(remote).unwrap_or_else(|_| "unavailable".to_string());
+                    report_waiting(remote, &watch, &found, &mut reported);
+                }
+                Err(err) => report_waiting(remote, &watch, &err.to_string(), &mut reported),
+            }
+        }
+        wait(stop, watch.every);
+    }
+}
+
+fn report_waiting(remote: &Path, watch: &RemoteWatch, found: &str, reported: &mut String) {
+    let wanted = watch.fs_types.join(":");
+    let message = format!(
+        "{} is {found}, waiting for {wanted}, next check {}",
+        remote.display(),
+        remote_pin::format_interval(watch.every)
+    );
+    if reported == &message {
+        return;
+    }
+    eprintln!("mirrorfs: remote {message}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    *reported = message;
+}
+
+fn remote_lost(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EIO
+                | libc::ESTALE
+                | libc::ETIMEDOUT
+                | libc::ENOTCONN
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::ENETDOWN
+                | libc::ENETUNREACH
+                | libc::ENETRESET
+                | libc::ECONNRESET
+                | libc::ECONNREFUSED
+                | libc::ENODEV
+                | libc::ESHUTDOWN
+                | libc::ENONET
+                | libc::EPIPE
+        )
+    )
 }
 
 fn run(
@@ -1718,5 +1974,100 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         assert!(!remote.join("a.txt").exists());
         let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    fn file_op() -> Op {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        Op::Create(Create {
+            path: PathBuf::from("hello.txt"),
+            kind: ObjectKind::File,
+            mode: 0o644,
+            uid,
+            gid,
+            rdev: 0,
+        })
+    }
+
+    struct Running {
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+        root: PathBuf,
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn start_watched(
+        name: &str,
+        fs_type: &str,
+        every: Duration,
+    ) -> (Running, PathBuf, PathBuf, Arc<Queue>) {
+        let (local_root, remote_root) = scratch(name);
+        let scratch_root = local_root.parent().unwrap().to_path_buf();
+        let local = local_root.join("nested");
+        let remote = remote_root.join("nested").join("mirror");
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        let queue = Arc::new(Queue::open(&local).unwrap());
+        queue.push(&file_op()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn(
+            Arc::clone(&queue),
+            local.clone(),
+            remote.clone(),
+            Arc::clone(&stop),
+            Arc::new(crate::sysfs::Counters::new()),
+            false,
+            Some(RemoteWatch {
+                fs_types: vec![fs_type.to_string()],
+                every,
+            }),
+        )
+        .unwrap();
+        (
+            Running {
+                stop,
+                handle: Some(handle),
+                root: scratch_root,
+            },
+            local,
+            remote,
+            queue,
+        )
+    }
+
+    #[test]
+    fn watched_subdirectory_drains_when_the_filesystem_matches() {
+        let sample = std::env::temp_dir();
+        let fstype = remote_pin::fstype_of(&sample).unwrap();
+        let (running, _local, remote, _queue) =
+            start_watched("watch-match", &fstype, Duration::from_secs(300));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !remote.join("hello.txt").exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            remote.join("hello.txt").is_file(),
+            "file was not created under the nested remote directory"
+        );
+        drop(running);
+    }
+
+    #[test]
+    fn watched_subdirectory_stays_queued_for_a_different_filesystem() {
+        let (running, _local, remote, queue) =
+            start_watched("watch-miss", "not-a-filesystem", Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(500));
+        assert!(!remote.join("hello.txt").exists());
+        assert!(queue.head().unwrap().is_some());
+        drop(running);
     }
 }

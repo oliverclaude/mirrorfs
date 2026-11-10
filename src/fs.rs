@@ -20,6 +20,7 @@ use fuser::{
 
 use crate::inode::InodeTable;
 use crate::queue::{Create, ObjectKind, Op, Queue, Setattr, WriteData};
+use crate::remote_pin::RemoteWatch;
 use crate::sysfs::{self, Counters};
 use crate::util::{self, TTL};
 
@@ -50,7 +51,12 @@ struct OpenDir {
 }
 
 impl MirrorFs {
-    pub fn new(local: PathBuf, remote: PathBuf, debug: bool) -> io::Result<Self> {
+    pub fn new(
+        local: PathBuf,
+        remote: PathBuf,
+        debug: bool,
+        watch: Option<RemoteWatch>,
+    ) -> io::Result<Self> {
         let st = util::lstat(&local)?;
         let queue = Arc::new(Queue::open(&local)?);
         let mut stripes = Vec::with_capacity(64);
@@ -66,6 +72,7 @@ impl MirrorFs {
             Arc::clone(&stop),
             Arc::clone(&counters),
             debug,
+            watch,
         )?;
         Ok(Self {
             local,
