@@ -1653,6 +1653,9 @@ impl MirrorFs {
         for item in dir {
             let item = item.map_err(Errno::from)?;
             let name = item.file_name();
+            // A local root entry named `sys` is shadowed by the virtual
+            // directory. That directory is also omitted from this listing:
+            // lookup still resolves the name, so it can be opened by path.
             if util::is_queue_name(&name) || (dir_ino == 1 && name == OsStr::new(sysfs::NAME)) {
                 continue;
             }
@@ -1667,13 +1670,6 @@ impl MirrorFs {
                 ino: fuse_ino,
                 kind: util::file_kind(st.st_mode),
                 name,
-            });
-        }
-        if dir_ino == 1 {
-            entries.push(DirEntry {
-                ino: sysfs::DIR,
-                kind: FileType::Directory,
-                name: OsString::from(sysfs::NAME),
             });
         }
         Ok(entries)

@@ -4,6 +4,10 @@
 //! in the mount, are not backed by the local directory, and are never queued
 //! for the remote. Inode numbers sit at the top of the `u64` range so they do
 //! not collide with a local `st_ino`.
+//!
+//! The directory is left out of the mount root's listing, including `ls -a`.
+//! Lookup of the name `sys` still succeeds, so `<mount>/sys` can be opened by
+//! path. The files inside that directory are listed once it is open.
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;

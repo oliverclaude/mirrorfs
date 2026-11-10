@@ -103,8 +103,8 @@ The binary is `target/release/mirrorfs`. It is dynamically linked against
 ### Debian package
 
 `packaging/build-deb.sh` builds the release binary and packs it as
-`dist/mirrorfs_<version>-2_<arch>.deb`. The package version follows
-`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-2`).
+`dist/mirrorfs_<version>-3_<arch>.deb`. The package version follows
+`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-3`).
 The package installs `/usr/bin/mirrorfs`, `man mirrorfs`, and
 `man fuse.mirrorfs`. Library dependencies are filled in by
 `dpkg-shlibdeps`. `fuse3` is added as well, because `fusermount3` is executed
@@ -123,14 +123,14 @@ MIRRORFS_CARGO_OFFLINE=1 packaging/build-deb.sh
 Install it on another machine with apt so the dependencies are pulled in:
 
 ```sh
-sudo apt-get install ./dist/mirrorfs_0.1.0-2_amd64.deb
+sudo apt-get install ./dist/mirrorfs_0.1.0-3_amd64.deb
 ```
 
 `dpkg -i` does not install dependencies. Install them first, then the package:
 
 ```sh
 sudo apt-get install fuse3 'libc6 (>= 2.39)' libgcc-s1
-sudo dpkg -i mirrorfs_0.1.0-2_amd64.deb
+sudo dpkg -i mirrorfs_0.1.0-3_amd64.deb
 ```
 
 The `.deb` built here is amd64 and needs glibc 2.39 or newer (`GLIBC_2.39`).
@@ -258,7 +258,9 @@ directory and append to the queue.
 ## Status files
 
 `mirrorfs` does not publish kernel sysfs entries. The same information is a
-directory at the mount root:
+directory at the mount root. It is omitted from directory listings, including
+`ls -a`. Opening the path still works, and the files inside are listed once
+the directory is open:
 
 ```text
 <mount>/sys/stats
@@ -341,8 +343,9 @@ directory is already there.
   unmount.
 - The mount does not follow paths that escape the local root. `.mirrorfs-queue`
   is hidden, not a security boundary against someone who can already write the
-  local directory directly. `<mount>/sys` is reserved: a local object of that
-  name at the root is not visible through the mount.
+  local directory directly. `<mount>/sys` is reserved and is omitted from
+  directory listings: a local object of that name at the root is not visible
+  through the mount, and the virtual directory is reachable only by path.
 
 ## Status
 

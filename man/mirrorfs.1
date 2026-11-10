@@ -98,6 +98,11 @@ The directory is hidden from the mount.
 .I <mount>/sys/errors
 Userspace status files.
 They are not kernel sysfs entries.
+The directory is omitted from listings of the mount root, including
+.BR "ls \-a" .
+Opening
+.I <mount>/sys
+still works, and the files inside are listed once it is open.
 The directory is mode 0555 and the files are mode 0444.
 .TP
 .I /var/log/mirrorfs.log
