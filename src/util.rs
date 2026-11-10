@@ -23,6 +23,21 @@ pub fn local_path(root: &Path, rel: &Path) -> PathBuf {
     }
 }
 
+/// Path after `from` is renamed to `to`. A name inside `from` keeps its suffix.
+pub fn relocated_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    if from.as_os_str().is_empty() || path.as_os_str().is_empty() {
+        return None;
+    }
+    if path == from {
+        return Some(to.to_path_buf());
+    }
+    let rest = path.strip_prefix(from).ok()?;
+    if rest.as_os_str().is_empty() {
+        return Some(to.to_path_buf());
+    }
+    Some(to.join(rest))
+}
+
 pub fn lstat(path: &Path) -> io::Result<libc::stat> {
     let c = cstring(path)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };

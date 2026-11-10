@@ -20,8 +20,10 @@ The local directory is the only source of truth.
   the remote directory by one background thread.
 - File handles opened through the mount refer only to local files. The remote
   directory is never held open.
-- Metadata changes (`chmod`, `chown`, `utimens`, `setxattr`, and the rest of
-  `setattr`) use the same path: local first, then queue.
+- Metadata changes (`chmod`, `chown`, `utimens`, `setxattr`, `removexattr`,
+  and the rest of `setattr`) use the same path: local first, then queue.
+  `rename`, `link`, `symlink`, and `fallocate` do too. `getxattr` and
+  `listxattr` are local reads.
 - Out-of-band changes are not detected and are not queued. A lookup still
   reads the local directory, because that directory is the source of truth, so
   a file written directly under `--local` can show up on a later lookup.
@@ -157,6 +159,21 @@ directory and append to the queue.
   fails, the failure is retried, which stalls the queue until it can succeed.
 - Extended attributes that the remote filesystem rejects with `ENOTSUP` are
   logged and skipped so one unsupported xattr cannot wedge the mirror.
+  `fallocate` is skipped the same way when the remote returns `ENOTSUP`.
+- A plain rename of a path mirrorfs already knows (the path itself, or a
+  file inside it) is replayed with `rename`. If that record is applied twice,
+  the second attempt sees the source gone and the destination present and
+  treats that as success. `RENAME_EXCHANGE` is not idempotent: applying it
+  twice swaps the names back. NFS rejects the exchange flag, so the worker
+  swaps the two remote objects with three renames through a temporary name,
+  `.mirrorfs-exchange`, in the destination's parent. A crash between those
+  renames is finished on the next attempt. A crash after the swap, before
+  the record is deleted, swaps them again.
+- An exchange where mirrorfs does not yet know both sides copies the local
+  object at each exchanged path instead of renaming. A directory copy does
+  not include the names inside it, so children that were already mirrored
+  stay at their old remote path.
+- `RENAME_WHITEOUT` is rejected with `EOPNOTSUPP` and is not applied locally.
 - POSIX byte-range locks, `ioctl`, and `copy_file_range` are not implemented.
   The kernel falls back to plain reads and writes for copies.
 - Inode records for names seen during the mount are cached until `forget` or
@@ -172,5 +189,7 @@ applies the oldest `.mirrorfs-queue/` record to the remote directory and
 deletes it only after that call succeeds. A remote error leaves the record in
 place and retries it, including after the process is killed. A mutation of a
 path mirrorfs has not already created or copied is preceded by a snapshot of
-that local object. The next piece is rename, link, symlink, xattr, and
-fallocate.
+that local object. Rename, link, symlink, xattr, and fallocate are applied
+locally and queued the same way. A rename of a tree mirrorfs already knows
+moves that tree on the remote. A rename of a path it does not know copies
+the local object at its new path.

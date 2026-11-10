@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::util;
+
 /// Inode cache for one mount.
 ///
 /// Fuse inode 1 is always the local root. Other fuse inodes prefer the local
@@ -155,6 +157,67 @@ impl InodeTable {
         }
     }
 
+    /// Record a successful local rename. `to_parent` is the fuse parent of the
+    /// destination. On exchange, `from_parent` is the fuse parent of `from`.
+    pub fn rename(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        to_parent: u64,
+        exchange: bool,
+        from_parent: u64,
+    ) {
+        if from.as_os_str().is_empty() || to.as_os_str().is_empty() || from == to {
+            return;
+        }
+        if !exchange {
+            self.drop_tree(to);
+        }
+        let snapshot: Vec<(PathBuf, u64)> = self
+            .by_rel
+            .iter()
+            .map(|(path, ino)| (path.clone(), *ino))
+            .collect();
+        let mut planned = Vec::new();
+        for (path, ino) in snapshot {
+            if let Some(neu) = util::relocated_path(&path, from, to) {
+                planned.push((path, neu, ino, to_parent));
+            } else if exchange {
+                if let Some(neu) = util::relocated_path(&path, to, from) {
+                    planned.push((path, neu, ino, from_parent));
+                }
+            }
+        }
+        for (old, _, _, _) in &planned {
+            self.by_rel.remove(old);
+        }
+        for (old, new, ino, parent) in planned {
+            self.by_rel.insert(new.clone(), ino);
+            let Some(inode) = self.by_ino.get_mut(&ino) else {
+                continue;
+            };
+            if inode.rel == old {
+                let moved_root = old == from || (exchange && old == to);
+                inode.rel = new;
+                if moved_root {
+                    inode.parent = parent;
+                }
+            }
+        }
+    }
+
+    fn drop_tree(&mut self, root: &Path) {
+        let paths: Vec<PathBuf> = self
+            .by_rel
+            .keys()
+            .filter(|path| *path == root || path.starts_with(root))
+            .cloned()
+            .collect();
+        for path in paths {
+            self.unbind(&path);
+        }
+    }
+
     /// Drop one directory entry. If it was the path used for getattr, switch
     /// to another hard link that is still cached. The last name also drops
     /// the `st_ino` map so the number can be reused safely.
@@ -280,5 +343,45 @@ mod tests {
         let linked = table.intern(PathBuf::from("c"), 1, 10, true);
         assert_eq!(linked, second);
         assert_eq!(table.rel(first), None);
+    }
+
+    #[test]
+    fn rename_moves_the_directory_and_its_children() {
+        let mut table = InodeTable::new(2);
+        let dir = table.intern(PathBuf::from("dir"), 1, 10, true);
+        let child = table.intern(PathBuf::from("dir/a"), dir, 11, true);
+        table.rename(Path::new("dir"), Path::new("other"), 1, false, 1);
+        assert_eq!(table.rel(dir).unwrap().as_os_str(), "other");
+        assert_eq!(table.parent(dir), Some(1));
+        assert_eq!(table.rel(child).unwrap().as_os_str(), "other/a");
+        assert_eq!(table.parent(child), Some(dir));
+        assert!(table
+            .paths_for(dir)
+            .iter()
+            .all(|path| path != Path::new("dir")));
+    }
+
+    #[test]
+    fn rename_replaces_the_destination_cache() {
+        let mut table = InodeTable::new(2);
+        let src = table.intern(PathBuf::from("a"), 1, 10, true);
+        let dst = table.intern(PathBuf::from("b"), 1, 11, true);
+        table.rename(Path::new("a"), Path::new("b"), 1, false, 1);
+        assert_eq!(table.rel(src).unwrap().as_os_str(), "b");
+        assert!(table.paths_for(dst).is_empty());
+    }
+
+    #[test]
+    fn exchange_swaps_two_trees() {
+        let mut table = InodeTable::new(2);
+        let left = table.intern(PathBuf::from("left"), 1, 10, true);
+        let right_parent = 1;
+        let right = table.intern(PathBuf::from("right"), right_parent, 11, true);
+        let child = table.intern(PathBuf::from("left/a"), left, 12, true);
+        table.rename(Path::new("left"), Path::new("right"), 1, true, 1);
+        assert_eq!(table.rel(left).unwrap().as_os_str(), "right");
+        assert_eq!(table.rel(right).unwrap().as_os_str(), "left");
+        assert_eq!(table.rel(child).unwrap().as_os_str(), "right/a");
+        assert_eq!(table.parent(child), Some(left));
     }
 }

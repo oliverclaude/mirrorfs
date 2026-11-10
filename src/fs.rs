@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request, TimeOrNow,
+    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::inode::InodeTable;
@@ -80,6 +80,15 @@ impl MirrorFs {
         rel.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.stripes.len();
         self.stripes[index].lock().expect("stripe lock")
+    }
+
+    /// Every mutation stripe. A directory rename covers child paths that hash
+    /// to other stripes.
+    fn lock_all(&self) -> Vec<MutexGuard<'_, ()>> {
+        self.stripes
+            .iter()
+            .map(|stripe| stripe.lock().expect("stripe lock"))
+            .collect()
     }
 
     /// Intern `rel`, unless the cached `st_ino` now names a different object.
@@ -611,24 +620,31 @@ impl Filesystem for MirrorFs {
             }
         };
         let _guard = self.stripe(&open.1);
+        let rel = self
+            .files
+            .lock()
+            .expect("file lock")
+            .get(&fh.0)
+            .map(|open| open.rel.clone())
+            .unwrap_or(open.1);
         match open.0.write_at(data, offset) {
             Ok(n) => {
                 let op = Op::Write(WriteData {
-                    path: open.1.clone(),
+                    path: rel.clone(),
                     offset,
                     data: data[..n].to_vec(),
                 });
                 if let Err(errno) = self.enqueue(&op) {
-                    self.log("write", &open.1, &errno_label(errno), false);
+                    self.log("write", &rel, &errno_label(errno), false);
                     reply.error(errno);
                     return;
                 }
-                self.log("write", &open.1, "ok", true);
+                self.log("write", &rel, "ok", true);
                 reply.written(n as u32);
             }
             Err(err) => {
                 let errno = Errno::from(err);
-                self.log("write", &open.1, &errno_label(errno), false);
+                self.log("write", &rel, &errno_label(errno), false);
                 reply.error(errno);
             }
         }
@@ -669,6 +685,13 @@ impl Filesystem for MirrorFs {
                 .map(|open| Arc::clone(&open.file))
         });
         let _guard = self.stripe(&rel);
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
         let full = util::local_path(&self.local, &rel);
         let result = (|| {
             if let Some(size) = size {
@@ -859,6 +882,13 @@ impl Filesystem for MirrorFs {
             }
         };
         let _guard = self.stripe(&open.1);
+        let rel = self
+            .files
+            .lock()
+            .expect("file lock")
+            .get(&fh.0)
+            .map(|open| open.rel.clone())
+            .unwrap_or_else(|| open.1.clone());
         let synced = if datasync {
             open.0.sync_data()
         } else {
@@ -866,20 +896,424 @@ impl Filesystem for MirrorFs {
         };
         if let Err(err) = synced {
             let errno = Errno::from(err);
-            self.log("fsync", &open.1, &errno_label(errno), false);
+            self.log("fsync", &rel, &errno_label(errno), false);
             reply.error(errno);
             return;
         }
         if let Err(errno) = self.enqueue(&Op::Fsync {
-            path: open.1.clone(),
+            path: rel.clone(),
             datasync,
         }) {
-            self.log("fsync", &open.1, &errno_label(errno), false);
+            self.log("fsync", &rel, &errno_label(errno), false);
             reply.error(errno);
             return;
         }
-        self.log("fsync", &open.1, "ok", true);
+        self.log("fsync", &rel, "ok", true);
         reply.ok();
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let rel = match self.child_rel(parent.0, name) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let _guard = self.stripe(&rel);
+        let rel = match self.child_rel(parent.0, name) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let full = util::local_path(&self.local, &rel);
+        let result = (|| {
+            let path_c = util::cstring(&full).map_err(Errno::from)?;
+            let target_c =
+                CString::new(target.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+            let rc = unsafe { libc::symlink(target_c.as_ptr(), path_c.as_ptr()) };
+            if rc < 0 {
+                return Err(Errno::from(io::Error::last_os_error()));
+            }
+            if let Err(err) = util::lchown_path(&full, req.uid(), req.gid()) {
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(Errno::from(err));
+                }
+            }
+            self.enqueue(&Op::Symlink {
+                path: rel.clone(),
+                target: target.as_os_str().as_bytes().to_vec(),
+                uid: req.uid(),
+                gid: req.gid(),
+            })
+        })();
+        match result {
+            Ok(()) => self.reply_new_entry("symlink", parent.0, &rel, reply),
+            Err(errno) => {
+                self.log("symlink", &rel, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if flags.contains(RenameFlags::RENAME_WHITEOUT) {
+            reply.error(Errno::from(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            return;
+        }
+        let from = match self.child_rel(parent.0, name) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let to = match self.child_rel(newparent.0, newname) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        if from == to {
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                self.log("rename", &from, &errno_label(Errno::EINVAL), false);
+                reply.error(Errno::EINVAL);
+            } else {
+                self.log("rename", &from, "ok", false);
+                reply.ok();
+            }
+            return;
+        }
+        let _stripes = self.lock_all();
+        let from = match self.child_rel(parent.0, name) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let to = match self.child_rel(newparent.0, newname) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        if from == to {
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                self.log("rename", &from, &errno_label(Errno::EINVAL), false);
+                reply.error(Errno::EINVAL);
+            } else {
+                self.log("rename", &from, "ok", false);
+                reply.ok();
+            }
+            return;
+        }
+        let renamed = (|| {
+            let src = util::local_path(&self.local, &from);
+            let dst = util::local_path(&self.local, &to);
+            let src_c = util::cstring(&src).map_err(Errno::from)?;
+            let dst_c = util::cstring(&dst).map_err(Errno::from)?;
+            let rc = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    src_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    dst_c.as_ptr(),
+                    flags.bits(),
+                )
+            };
+            if rc < 0 {
+                return Err(Errno::from(io::Error::last_os_error()));
+            }
+            let exchange = flags.contains(RenameFlags::RENAME_EXCHANGE);
+            self.inodes.lock().expect("inode lock").rename(
+                &from,
+                &to,
+                newparent.0,
+                exchange,
+                parent.0,
+            );
+            self.retarget_handles(&from, &to, exchange);
+            self.enqueue(&Op::Rename {
+                from: from.clone(),
+                to: to.clone(),
+                flags: flags.bits(),
+            })
+        })();
+        match renamed {
+            Ok(()) => {
+                self.log("rename", &from, "ok", true);
+                reply.ok();
+            }
+            Err(errno) => {
+                self.log("rename", &from, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let _stripes = self.lock_all();
+        let from = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let to = match self.child_rel(newparent.0, newname) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let linked = (|| {
+            let src = util::local_path(&self.local, &from);
+            let dst = util::local_path(&self.local, &to);
+            let src_c = util::cstring(&src).map_err(Errno::from)?;
+            let dst_c = util::cstring(&dst).map_err(Errno::from)?;
+            let rc = unsafe { libc::link(src_c.as_ptr(), dst_c.as_ptr()) };
+            if rc < 0 {
+                return Err(Errno::from(io::Error::last_os_error()));
+            }
+            self.enqueue(&Op::Link {
+                from: from.clone(),
+                to: to.clone(),
+            })
+        })();
+        match linked {
+            Ok(()) => self.reply_new_entry("link", newparent.0, &to, reply),
+            Err(errno) => {
+                self.log("link", &to, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let _guard = self.stripe(&rel);
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let changed = (|| {
+            let full = util::local_path(&self.local, &rel);
+            set_local_xattr(&full, name, value, flags)?;
+            self.enqueue(&Op::Setxattr {
+                path: rel.clone(),
+                name: name.as_bytes().to_vec(),
+                value: value.to_vec(),
+                flags,
+            })
+        })();
+        match changed {
+            Ok(()) => {
+                self.log("setxattr", &rel, "ok", true);
+                reply.ok();
+            }
+            Err(errno) => {
+                self.log("setxattr", &rel, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let full = util::local_path(&self.local, &rel);
+        match read_local_xattr(&full, name) {
+            Ok(value) => {
+                self.trace("getxattr", &rel, "ok");
+                reply_xattr(reply, size, &value);
+            }
+            Err(errno) => {
+                self.trace("getxattr", &rel, &errno_label(errno));
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let full = util::local_path(&self.local, &rel);
+        match list_local_xattr(&full) {
+            Ok(names) => {
+                self.trace("listxattr", &rel, "ok");
+                reply_xattr(reply, size, &names);
+            }
+            Err(errno) => {
+                self.trace("listxattr", &rel, &errno_label(errno));
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let _guard = self.stripe(&rel);
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let removed = (|| {
+            let full = util::local_path(&self.local, &rel);
+            let path_c = util::cstring(&full).map_err(Errno::from)?;
+            let name_c = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+            let rc = unsafe { libc::lremovexattr(path_c.as_ptr(), name_c.as_ptr()) };
+            if rc < 0 {
+                return Err(Errno::from(io::Error::last_os_error()));
+            }
+            self.enqueue(&Op::Removexattr {
+                path: rel.clone(),
+                name: name.as_bytes().to_vec(),
+            })
+        })();
+        match removed {
+            Ok(()) => {
+                self.log("removexattr", &rel, "ok", true);
+                reply.ok();
+            }
+            Err(errno) => {
+                self.log("removexattr", &rel, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let file = {
+            let files = self.files.lock().expect("file lock");
+            files.get(&fh.0).map(|open| Arc::clone(&open.file))
+        };
+        let _guard = self.stripe(&rel);
+        let rel = match self.rel_of(ino.0) {
+            Ok(rel) => rel,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        let allocated = (|| {
+            if offset > i64::MAX as u64 || length > i64::MAX as u64 {
+                return Err(Errno::EINVAL);
+            }
+            let owned;
+            let fd = if let Some(open) = &file {
+                open.as_raw_fd()
+            } else {
+                owned = self.open_local(&rel, OpenFlags(libc::O_WRONLY))?;
+                owned.as_raw_fd()
+            };
+            let rc =
+                unsafe { libc::fallocate(fd, mode, offset as libc::off_t, length as libc::off_t) };
+            if rc < 0 {
+                return Err(Errno::from(io::Error::last_os_error()));
+            }
+            self.enqueue(&Op::Fallocate {
+                path: rel.clone(),
+                offset,
+                length,
+                mode,
+            })
+        })();
+        match allocated {
+            Ok(()) => {
+                self.log("fallocate", &rel, "ok", true);
+                reply.ok();
+            }
+            Err(errno) => {
+                self.log("fallocate", &rel, &errno_label(errno), false);
+                reply.error(errno);
+            }
+        }
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -1043,6 +1477,28 @@ impl MirrorFs {
         }
         Ok(entries)
     }
+
+    /// Open file and directory paths move with a rename. Called while every
+    /// stripe is held, then the file map and the directory map.
+    fn retarget_handles(&self, from: &Path, to: &Path, exchange: bool) {
+        let retarget = |rel: &mut PathBuf| {
+            if let Some(moved) = util::relocated_path(rel, from, to) {
+                *rel = moved;
+                return;
+            }
+            if exchange {
+                if let Some(moved) = util::relocated_path(rel, to, from) {
+                    *rel = moved;
+                }
+            }
+        };
+        for open in self.files.lock().expect("file lock").values_mut() {
+            retarget(&mut open.rel);
+        }
+        for open in self.dirs.lock().expect("dir lock").values_mut() {
+            retarget(&mut open.rel);
+        }
+    }
 }
 
 fn fill_dir(entries: &[DirEntry], offset: u64, mut reply: ReplyDirectory) {
@@ -1057,6 +1513,95 @@ fn fill_dir(entries: &[DirEntry], offset: u64, mut reply: ReplyDirectory) {
 
 fn errno_label(errno: Errno) -> String {
     format!("err:{}", errno.code())
+}
+
+fn set_local_xattr(path: &Path, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno> {
+    let path_c = util::cstring(path).map_err(Errno::from)?;
+    let name_c = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let rc = unsafe {
+        libc::lsetxattr(
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            value.as_ptr().cast::<libc::c_void>(),
+            value.len(),
+            flags,
+        )
+    };
+    if rc < 0 {
+        return Err(Errno::from(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn read_local_xattr(path: &Path, name: &OsStr) -> Result<Vec<u8>, Errno> {
+    let path_c = util::cstring(path).map_err(Errno::from)?;
+    let name_c = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let mut size =
+        unsafe { libc::lgetxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(Errno::from(io::Error::last_os_error()));
+    }
+    let mut buf = vec![0u8; size as usize];
+    if size == 0 {
+        return Ok(buf);
+    }
+    size = unsafe {
+        libc::lgetxattr(
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+        )
+    };
+    if size < 0 {
+        return Err(Errno::from(io::Error::last_os_error()));
+    }
+    buf.truncate(size as usize);
+    Ok(buf)
+}
+
+fn list_local_xattr(path: &Path) -> Result<Vec<u8>, Errno> {
+    let path_c = util::cstring(path).map_err(Errno::from)?;
+    let mut buf = Vec::new();
+    for _ in 0..4 {
+        let listed = unsafe { libc::llistxattr(path_c.as_ptr(), std::ptr::null_mut(), 0) };
+        if listed < 0 {
+            return Err(Errno::from(io::Error::last_os_error()));
+        }
+        buf.resize(listed as usize, 0);
+        if listed == 0 {
+            return Ok(buf);
+        }
+        let listed = unsafe {
+            libc::llistxattr(
+                path_c.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if listed < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ERANGE) {
+                continue;
+            }
+            return Err(Errno::from(err));
+        }
+        buf.truncate(listed as usize);
+        return Ok(buf);
+    }
+    Err(Errno::ERANGE)
+}
+
+fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+        return;
+    }
+    if value.len() > size as usize {
+        reply.error(Errno::ERANGE);
+        return;
+    }
+    reply.data(value);
 }
 
 fn object_kind(mode: u32) -> ObjectKind {

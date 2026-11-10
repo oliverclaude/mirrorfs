@@ -209,14 +209,32 @@ impl Queue {
 
     /// Queue `op`. A write or metadata change for a path the remote does not
     /// yet have is preceded by a full snapshot of the local object.
+    ///
+    /// A rename whose source tree is already on the remote is replayed as a
+    /// rename. Otherwise the post-rename object is copied and the rename
+    /// itself is not queued, because the remote has nothing to move.
     pub fn push_for_remote(&self, local_root: &Path, op: &Op) -> io::Result<u64> {
         let dir = self.dir.clone();
         let mut state = self.inner.lock().expect("queue lock");
-        if wants_snapshot(op) && !effective_has(&dir, &state.base, op.path())? {
-            let snap = snapshot(local_root, op.path())?;
-            write_op(&dir, &mut state, &Op::Copy(snap))?;
+        match op {
+            Op::Rename { from, to, flags } => {
+                queue_rename(&dir, &mut state, local_root, from, to, *flags)
+            }
+            Op::Link { from, .. } => {
+                if !effective_has(&dir, &state.base, from)? {
+                    let snap = snapshot(local_root, from)?;
+                    write_op(&dir, &mut state, &Op::Copy(snap))?;
+                }
+                write_op(&dir, &mut state, op)
+            }
+            _ => {
+                if wants_snapshot(op) && !effective_has(&dir, &state.base, op.path())? {
+                    let snap = snapshot(local_root, op.path())?;
+                    write_op(&dir, &mut state, &Op::Copy(snap))?;
+                }
+                write_op(&dir, &mut state, op)
+            }
         }
-        write_op(&dir, &mut state, op)
     }
 
     /// Record that `op` reached the remote, then drop its queue file.
@@ -320,8 +338,94 @@ fn note_effect(base: &mut HashSet<PathBuf>, op: &Op) -> bool {
         Op::Create(op) => base.insert(op.path.clone()),
         Op::Copy(op) => base.insert(op.path.clone()),
         Op::Unlink(path) | Op::Rmdir(path) => base.remove(path),
+        Op::Link { to, .. } => base.insert(to.clone()),
+        Op::Symlink { path, .. } => base.insert(path.clone()),
+        Op::Rename { from, to, flags } => note_rename(base, from, to, *flags),
         _ => false,
     }
+}
+
+fn note_rename(base: &mut HashSet<PathBuf>, from: &Path, to: &Path, flags: u32) -> bool {
+    let exchange = flags & libc::RENAME_EXCHANGE != 0;
+    let before = base.clone();
+    if !exchange {
+        base.retain(|path| path != to && !path.starts_with(to));
+    }
+    let paths: Vec<PathBuf> = base.iter().cloned().collect();
+    let mut moves = Vec::new();
+    for path in paths {
+        if let Some(neu) = util::relocated_path(&path, from, to) {
+            moves.push((path, neu));
+        } else if exchange {
+            if let Some(neu) = util::relocated_path(&path, to, from) {
+                moves.push((path, neu));
+            }
+        }
+    }
+    for (old, _) in &moves {
+        base.remove(old);
+    }
+    for (_, neu) in moves {
+        base.insert(neu);
+    }
+    base != &before
+}
+
+fn load_effective(dir: &Path, base: &HashSet<PathBuf>) -> io::Result<HashSet<PathBuf>> {
+    let mut set = base.clone();
+    for (_, op) in read_pending(dir)? {
+        note_effect(&mut set, &op);
+    }
+    Ok(set)
+}
+
+fn covers(set: &HashSet<PathBuf>, path: &Path) -> bool {
+    set.contains(path) || set.iter().any(|have| have.starts_with(path))
+}
+
+fn queue_rename(
+    dir: &Path,
+    state: &mut State,
+    local_root: &Path,
+    from: &Path,
+    to: &Path,
+    flags: u32,
+) -> io::Result<u64> {
+    let known = load_effective(dir, &state.base)?;
+    let has_from = covers(&known, from);
+    let has_to = covers(&known, to);
+    let exchange = flags & libc::RENAME_EXCHANGE != 0;
+    if exchange && has_from && has_to {
+        return write_op(
+            dir,
+            state,
+            &Op::Rename {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                flags,
+            },
+        );
+    }
+    if exchange || !has_from {
+        // The remote is missing a side, so replaying the rename cannot land
+        // on the post-rename tree. Copy the local end state instead.
+        let paths: &[&Path] = if exchange { &[from, to] } else { &[to] };
+        let mut seq = 0;
+        for path in paths {
+            let snap = snapshot(local_root, path)?;
+            seq = write_op(dir, state, &Op::Copy(snap))?;
+        }
+        return Ok(seq);
+    }
+    write_op(
+        dir,
+        state,
+        &Op::Rename {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            flags,
+        },
+    )
 }
 
 fn effective_has(dir: &Path, base: &HashSet<PathBuf>, path: &Path) -> io::Result<bool> {
@@ -533,6 +637,45 @@ impl Op {
             | Op::Fsync { path, .. }
             | Op::Fallocate { path, .. } => path,
             Op::Copy(op) => &op.path,
+        }
+    }
+
+    #[allow(dead_code)] // The virtual sys/queue file prints this.
+    pub fn describe(&self) -> String {
+        match self {
+            Op::Rename { from, to, flags } => {
+                format!(
+                    "rename {} -> {} flags={flags}",
+                    from.display(),
+                    to.display()
+                )
+            }
+            Op::Link { from, to } => format!("link {} -> {}", from.display(), to.display()),
+            Op::Symlink { path, target, .. } => format!(
+                "symlink {} -> {}",
+                path.display(),
+                String::from_utf8_lossy(target)
+            ),
+            Op::Setxattr { path, name, .. } => format!(
+                "setxattr {} {}",
+                path.display(),
+                String::from_utf8_lossy(name)
+            ),
+            Op::Removexattr { path, name } => format!(
+                "removexattr {} {}",
+                path.display(),
+                String::from_utf8_lossy(name)
+            ),
+            Op::Fallocate {
+                path,
+                offset,
+                length,
+                mode,
+            } => format!(
+                "fallocate {} offset={offset} length={length} mode={mode}",
+                path.display()
+            ),
+            other => format!("{} {}", other.kind_name(), other.path().display()),
         }
     }
 
@@ -1112,6 +1255,100 @@ mod tests {
         let pending = queue.pending().unwrap();
         assert_eq!(pending.len(), 3);
         assert!(matches!(pending[2].1, Op::Write(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn known_rename_moves_descendant_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "mirrorfs-ren-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("other/a"), b"child").unwrap();
+        let queue = Queue::open(&root).unwrap();
+        let dir = Op::Create(Create {
+            path: PathBuf::from("dir"),
+            kind: ObjectKind::Dir,
+            mode: 0o755,
+            uid: 1,
+            gid: 1,
+            rdev: 0,
+        });
+        let child = Op::Create(Create {
+            path: PathBuf::from("dir/a"),
+            kind: ObjectKind::File,
+            mode: 0o644,
+            uid: 1,
+            gid: 1,
+            rdev: 0,
+        });
+        let dir_seq = queue.push(&dir).unwrap();
+        let child_seq = queue.push(&child).unwrap();
+        queue.finish(dir_seq, &dir).unwrap();
+        queue.finish(child_seq, &child).unwrap();
+        let rename = Op::Rename {
+            from: PathBuf::from("dir"),
+            to: PathBuf::from("other"),
+            flags: 0,
+        };
+        queue.push_for_remote(&root, &rename).unwrap();
+        let pending = queue.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, rename);
+        queue.finish(pending[0].0, &rename).unwrap();
+        queue
+            .push_for_remote(
+                &root,
+                &Op::Write(WriteData {
+                    path: PathBuf::from("other/a"),
+                    offset: 0,
+                    data: b"Z".to_vec(),
+                }),
+            )
+            .unwrap();
+        let pending = queue.pending().unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(matches!(pending[0].1, Op::Write(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_rename_copies_the_new_path() {
+        let root = std::env::temp_dir().join(format!(
+            "mirrorfs-ren2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("new.txt"), b"moved").unwrap();
+        let queue = Queue::open(&root).unwrap();
+        queue
+            .push_for_remote(
+                &root,
+                &Op::Rename {
+                    from: PathBuf::from("old.txt"),
+                    to: PathBuf::from("new.txt"),
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        let pending = queue.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        match &pending[0].1 {
+            Op::Copy(snap) => {
+                assert_eq!(snap.path, PathBuf::from("new.txt"));
+                assert_eq!(snap.data, b"moved");
+            }
+            other => panic!("expected copy, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1,7 +1,9 @@
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -107,15 +109,27 @@ pub fn apply(local_root: &Path, remote_root: &Path, op: &Op) -> io::Result<()> {
         Op::Rmdir(path) => remove_dir(&remote_path(remote_root, path)?),
         Op::Fsync { path, datasync } => apply_fsync(&remote_path(remote_root, path)?, *datasync),
         Op::Copy(op) => apply_copy(local_root, remote_root, op),
-        Op::Rename { .. }
-        | Op::Link { .. }
-        | Op::Symlink { .. }
-        | Op::Setxattr { .. }
-        | Op::Removexattr { .. }
-        | Op::Fallocate { .. } => Err(io::Error::new(
-            ErrorKind::Unsupported,
-            format!("queued {} is not applied yet", op.kind_name()),
-        )),
+        Op::Rename { from, to, flags } => apply_rename(local_root, remote_root, from, to, *flags),
+        Op::Link { from, to } => apply_link(local_root, remote_root, from, to),
+        Op::Symlink {
+            path,
+            target,
+            uid,
+            gid,
+        } => apply_symlink(local_root, remote_root, path, target, *uid, *gid),
+        Op::Setxattr {
+            path,
+            name,
+            value,
+            flags,
+        } => apply_setxattr(remote_root, path, name, value, *flags),
+        Op::Removexattr { path, name } => apply_removexattr(remote_root, path, name),
+        Op::Fallocate {
+            path,
+            offset,
+            length,
+            mode,
+        } => apply_fallocate(remote_root, path, *offset, *length, *mode),
     }
 }
 
@@ -425,6 +439,297 @@ fn set_xattrs(path: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
     Ok(())
 }
 
+fn apply_rename(local: &Path, remote: &Path, from: &Path, to: &Path, flags: u32) -> io::Result<()> {
+    ensure_parents(local, remote, to)?;
+    if flags & libc::RENAME_EXCHANGE != 0 {
+        ensure_parents(local, remote, from)?;
+    }
+    let src = remote_path(remote, from)?;
+    let dst = remote_path(remote, to)?;
+    let src_c = util::cstring(&src)?;
+    let dst_c = util::cstring(&dst)?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            flags,
+        )
+    };
+    if rc == 0 {
+        return restamp_rename(local, remote, from, to, flags);
+    }
+    let err = io::Error::last_os_error();
+    // NFS rejects RENAME_EXCHANGE with EINVAL. Swap through a temporary name
+    // instead of leaving the record at the head of the queue forever.
+    if flags & libc::RENAME_EXCHANGE != 0 && is_exchange_unsupported(&err) {
+        eprintln!(
+            "mirrorfs: remote rename exchange is not supported, swapping {} and {}",
+            src.display(),
+            dst.display()
+        );
+        exchange_fallback(&src, &dst)?;
+        return restamp_rename(local, remote, from, to, flags);
+    }
+    // A crash after a successful plain rename retries the record. The source
+    // is already gone and the destination is already there. Exchange is not
+    // idempotent: replaying it swaps the two names again.
+    if flags & libc::RENAME_EXCHANGE == 0
+        && err.kind() == ErrorKind::NotFound
+        && util::lstat(&src).is_err()
+        && util::lstat(&dst).is_ok()
+    {
+        return Ok(());
+    }
+    Err(err)
+}
+
+fn restamp_rename(
+    local: &Path,
+    remote: &Path,
+    from: &Path,
+    to: &Path,
+    flags: u32,
+) -> io::Result<()> {
+    restamp_parents(local, remote, to)?;
+    if flags & libc::RENAME_EXCHANGE != 0 {
+        restamp_parents(local, remote, from)?;
+    }
+    Ok(())
+}
+
+/// `RENAME_EXCHANGE` via three plain renames. NFS rejects the exchange flag,
+/// and it also rejects `RENAME_NOREPLACE` when the destination is absent.
+/// A leftover `.mirrorfs-exchange` in the destination parent means a previous
+/// attempt stopped between those calls, and this finishes it.
+fn exchange_fallback(src: &Path, dst: &Path) -> io::Result<()> {
+    let parent = dst.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "exchange destination has no parent",
+        )
+    })?;
+    let tmp = parent.join(".mirrorfs-exchange");
+    if tmp == src || tmp == dst {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "exchange path collides with the temporary name",
+        ));
+    }
+    let src_exists = path_exists(src)?;
+    let dst_exists = path_exists(dst)?;
+    let tmp_exists = path_exists(&tmp)?;
+    if tmp_exists && !src_exists && dst_exists {
+        rename_absent(dst, src)?;
+        rename_absent(&tmp, dst)?;
+        return Ok(());
+    }
+    if tmp_exists && src_exists && !dst_exists {
+        rename_absent(&tmp, dst)?;
+        return Ok(());
+    }
+    if !tmp_exists && src_exists && dst_exists {
+        rename_absent(src, &tmp)?;
+        rename_absent(dst, src)?;
+        rename_absent(&tmp, dst)?;
+        return Ok(());
+    }
+    Err(io::Error::new(
+        ErrorKind::NotFound,
+        "exchange cannot be completed from the remote names",
+    ))
+}
+
+fn path_exists(path: &Path) -> io::Result<bool> {
+    match util::lstat(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn rename_absent(src: &Path, dst: &Path) -> io::Result<()> {
+    if path_exists(dst)? {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "exchange target already exists",
+        ));
+    }
+    let src_c = util::cstring(src)?;
+    let dst_c = util::cstring(dst)?;
+    let rc = unsafe { libc::rename(src_c.as_ptr(), dst_c.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn is_exchange_unsupported(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EINVAL) || is_unsupported(err)
+}
+
+fn apply_link(local: &Path, remote: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    ensure_parents(local, remote, to)?;
+    let src = remote_path(remote, from)?;
+    let dst = remote_path(remote, to)?;
+    let src_c = util::cstring(&src)?;
+    let dst_c = util::cstring(&dst)?;
+    let rc = unsafe { libc::link(src_c.as_ptr(), dst_c.as_ptr()) };
+    if rc == 0 {
+        restamp_parents(local, remote, to)?;
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == ErrorKind::AlreadyExists {
+        let left = util::lstat(&src)?;
+        let right = util::lstat(&dst)?;
+        if left.st_ino == right.st_ino && left.st_dev == right.st_dev {
+            return Ok(());
+        }
+    }
+    Err(err)
+}
+
+fn apply_symlink(
+    local: &Path,
+    remote: &Path,
+    path: &Path,
+    target: &[u8],
+    uid: u32,
+    gid: u32,
+) -> io::Result<()> {
+    ensure_parents(local, remote, path)?;
+    let full = remote_path(remote, path)?;
+    write_symlink(&full, target)?;
+    util::lchown_path(&full, uid, gid)?;
+    restamp_parents(local, remote, path)?;
+    Ok(())
+}
+
+fn apply_setxattr(
+    remote: &Path,
+    path: &Path,
+    name: &[u8],
+    value: &[u8],
+    flags: i32,
+) -> io::Result<()> {
+    let full = remote_path(remote, path)?;
+    let path_c = util::cstring(&full)?;
+    let name_c = xattr_name(name)?;
+    let rc = unsafe {
+        libc::lsetxattr(
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            flags,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if is_unsupported(&err) {
+        log_skip_xattr(&name_c, &full);
+        return Ok(());
+    }
+    if err.raw_os_error() == Some(libc::EEXIST) && xattr_eq(&path_c, &name_c, value)? {
+        return Ok(());
+    }
+    Err(err)
+}
+
+fn apply_removexattr(remote: &Path, path: &Path, name: &[u8]) -> io::Result<()> {
+    let full = remote_path(remote, path)?;
+    let path_c = util::cstring(&full)?;
+    let name_c = xattr_name(name)?;
+    let rc = unsafe { libc::lremovexattr(path_c.as_ptr(), name_c.as_ptr()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENODATA) || is_unsupported(&err) {
+        if is_unsupported(&err) {
+            log_skip_xattr(&name_c, &full);
+        }
+        return Ok(());
+    }
+    Err(err)
+}
+
+fn apply_fallocate(
+    remote: &Path,
+    path: &Path,
+    offset: u64,
+    length: u64,
+    mode: i32,
+) -> io::Result<()> {
+    let full = remote_path(remote, path)?;
+    let file = OpenOptions::new().write(true).open(&full)?;
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            mode,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if is_unsupported(&err) {
+        eprintln!(
+            "mirrorfs: fallocate is not supported on {}, skipping",
+            full.display()
+        );
+        return Ok(());
+    }
+    Err(err)
+}
+
+fn xattr_name(name: &[u8]) -> io::Result<CString> {
+    CString::new(name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "xattr name contains NUL"))
+}
+
+fn xattr_eq(path: &CString, name: &CString, value: &[u8]) -> io::Result<bool> {
+    let mut size =
+        unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Ok(false);
+    }
+    let mut buf = vec![0u8; size as usize];
+    size = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if size < 0 {
+        return Ok(false);
+    }
+    buf.truncate(size as usize);
+    Ok(buf == value)
+}
+
+fn is_unsupported(err: &io::Error) -> bool {
+    // ENOTSUP and EOPNOTSUPP are the same value on Linux.
+    err.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
+fn log_skip_xattr(name: &CString, path: &Path) {
+    eprintln!(
+        "mirrorfs: xattr {} is not supported on {}, skipping",
+        name.to_string_lossy(),
+        path.display()
+    );
+}
+
 fn apply_write(root: &Path, op: &WriteData) -> io::Result<()> {
     let path = remote_path(root, &op.path)?;
     let file = OpenOptions::new().write(true).open(&path)?;
@@ -718,6 +1023,165 @@ mod tests {
         let remote_st = util::lstat(&remote.join("snap")).unwrap();
         assert_eq!(remote_st.st_mtime, 1_557_119_289);
         assert_eq!(remote_st.st_mtime_nsec, 0);
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn rename_link_symlink_xattr_and_fallocate() {
+        let (local, remote) = scratch("meta");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let create = |path: &str, kind: ObjectKind, mode: u32| Create {
+            path: PathBuf::from(path),
+            kind,
+            mode,
+            uid,
+            gid,
+            rdev: 0,
+        };
+        apply(
+            &local,
+            &remote,
+            &Op::Create(create("dir", ObjectKind::Dir, 0o755)),
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Create(create("dir/a.txt", ObjectKind::File, 0o644)),
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Write(WriteData {
+                path: PathBuf::from("dir/a.txt"),
+                offset: 0,
+                data: b"hello".to_vec(),
+            }),
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Rename {
+                from: PathBuf::from("dir"),
+                to: PathBuf::from("other"),
+                flags: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(remote.join("other/a.txt")).unwrap(), b"hello");
+        assert!(!remote.join("dir").exists());
+        apply(
+            &local,
+            &remote,
+            &Op::Rename {
+                from: PathBuf::from("dir"),
+                to: PathBuf::from("other"),
+                flags: 0,
+            },
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Symlink {
+                path: PathBuf::from("other/link"),
+                target: b"a.txt".to_vec(),
+                uid,
+                gid,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(remote.join("other/link"))
+                .unwrap()
+                .as_os_str(),
+            "a.txt"
+        );
+        apply(
+            &local,
+            &remote,
+            &Op::Link {
+                from: PathBuf::from("other/a.txt"),
+                to: PathBuf::from("other/hard"),
+            },
+        )
+        .unwrap();
+        let file = util::lstat(&remote.join("other/a.txt")).unwrap();
+        let hard = util::lstat(&remote.join("other/hard")).unwrap();
+        assert_eq!(file.st_ino, hard.st_ino);
+        apply(
+            &local,
+            &remote,
+            &Op::Setxattr {
+                path: PathBuf::from("other/a.txt"),
+                name: b"user.mirrorfs".to_vec(),
+                value: b"hi".to_vec(),
+                flags: 0,
+            },
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Setxattr {
+                path: PathBuf::from("other/a.txt"),
+                name: b"user.mirrorfs".to_vec(),
+                value: b"hi".to_vec(),
+                flags: libc::XATTR_CREATE,
+            },
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Removexattr {
+                path: PathBuf::from("other/a.txt"),
+                name: b"user.mirrorfs".to_vec(),
+            },
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Removexattr {
+                path: PathBuf::from("other/a.txt"),
+                name: b"user.mirrorfs".to_vec(),
+            },
+        )
+        .unwrap();
+        apply(
+            &local,
+            &remote,
+            &Op::Fallocate {
+                path: PathBuf::from("other/a.txt"),
+                offset: 0,
+                length: 4096,
+                mode: 0,
+            },
+        )
+        .unwrap();
+        assert!(fs::metadata(remote.join("other/a.txt")).unwrap().len() >= 4096);
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn exchange_fallback_swaps_and_resumes() {
+        let (local, remote) = scratch("xchg");
+        fs::write(remote.join("a"), b"A").unwrap();
+        fs::write(remote.join("b"), b"B").unwrap();
+        exchange_fallback(&remote.join("a"), &remote.join("b")).unwrap();
+        assert_eq!(fs::read(remote.join("a")).unwrap(), b"B");
+        assert_eq!(fs::read(remote.join("b")).unwrap(), b"A");
+        assert!(!remote.join(".mirrorfs-exchange").exists());
+
+        fs::rename(remote.join("a"), remote.join(".mirrorfs-exchange")).unwrap();
+        exchange_fallback(&remote.join("a"), &remote.join("b")).unwrap();
+        assert_eq!(fs::read(remote.join("a")).unwrap(), b"A");
+        assert_eq!(fs::read(remote.join("b")).unwrap(), b"B");
+        assert!(!remote.join(".mirrorfs-exchange").exists());
         let _ = fs::remove_dir_all(local.parent().unwrap());
     }
 
