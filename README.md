@@ -62,24 +62,93 @@ records on disk for the next start.
 
 ## Build
 
-Install a stable Rust toolchain (rustup is fine; it stays in the user
-account) plus FUSE 3 headers:
+### Build dependencies
+
+Compiling needs a Rust toolchain that satisfies `rust-version` in
+`Cargo.toml` (1.85 or newer) and these Debian or Ubuntu packages:
+
+| Package | Why |
+| --- | --- |
+| `build-essential` | C toolchain used by Cargo build scripts |
+| `pkg-config` | Locates the FUSE headers when a dependency asks for them |
+| `libfuse3-dev` | FUSE 3 headers. Runtime linking does not use this library |
+| `fuse3` | Provides `fusermount3`, used to mount and unmount |
+| `dpkg-dev` | Provides `dpkg-deb` and `dpkg-shlibdeps` for the `.deb` |
 
 ```sh
-# Debian / Ubuntu. These packages are the system dependencies.
-sudo apt-get install libfuse3-dev fuse3 pkg-config build-essential
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install build-essential pkg-config libfuse3-dev fuse3 dpkg-dev
 ```
 
-On the build host used for this repo, `libfuse3-dev`, `fuse3`, and `pkg-config`
-were already installed. Rust lives in `~/.cargo` via rustup for the `claude`
-user. No boot-time service or kernel setting is required.
+Rust can come from rustup and stay in the user account. No boot-time service
+or kernel setting is required. The kernel still has to provide `/dev/fuse`,
+which a normal Linux kernel does.
+
+### Release binary
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary is `target/release/mirrorfs`.
+When the registry cannot be reached and `Cargo.lock` is already populated:
+
+```sh
+cargo build --release --locked --offline
+```
+
+The binary is `target/release/mirrorfs`. It is dynamically linked against
+`libc.so.6` and `libgcc_s.so.1` only. It talks to the kernel through
+`/dev/fuse` and runs `fusermount3` for mount and unmount. It does not link
+`libfuse`.
+
+### Debian package
+
+`packaging/build-deb.sh` builds the release binary and packs it as
+`dist/mirrorfs_<version>-1_<arch>.deb`. The package version follows
+`Cargo.toml` (currently `0.1.0-1`). Library dependencies are filled in by
+`dpkg-shlibdeps`. `fuse3` is added as well, because `fusermount3` is executed
+by name and is not a shared library.
+
+```sh
+packaging/build-deb.sh
+```
+
+Offline, on a machine that already has the lockfile dependencies cached:
+
+```sh
+MIRRORFS_CARGO_OFFLINE=1 packaging/build-deb.sh
+```
+
+Install it on another machine with apt so the dependencies are pulled in:
+
+```sh
+sudo apt-get install ./dist/mirrorfs_0.1.0-1_amd64.deb
+```
+
+`dpkg -i` does not install dependencies. Install them first, then the package:
+
+```sh
+sudo apt-get install fuse3 'libc6 (>= 2.39)' libgcc-s1
+sudo dpkg -i mirrorfs_0.1.0-1_amd64.deb
+```
+
+The `.deb` built here is amd64 and needs glibc 2.39 or newer (`GLIBC_2.39`).
+That matches Debian 13 and Ubuntu 24.04. Debian 12 and Ubuntu 22.04 are older
+than that and cannot run this binary. The installed command is
+`/usr/bin/mirrorfs`. The package does not change `/etc/fuse.conf`, does not
+add a user, and does not install a service.
+
+Runtime dependencies declared by the package:
+
+| Package | Why another system needs it |
+| --- | --- |
+| `libc6` (>= 2.39) | The binary is linked against glibc |
+| `libgcc-s1` | The binary is linked against `libgcc_s.so.1` |
+| `fuse3` | `fusermount3`, FUSE device setup, and the libfuse library that `fusermount3` itself uses |
+
+`libfuse3-dev` is only needed to compile. It is not a dependency of the
+`.deb`. On Debian 13 the library package pulled in by `fuse3` is
+`libfuse3-4`. Older Debian and Ubuntu releases name that library
+`libfuse3-3`. Depending on `fuse3` covers both.
 
 ## Mount
 
@@ -114,12 +183,15 @@ the local tree and on the remote.
 As root, `/etc/fuse.conf` does not need `user_allow_other`:
 
 ```sh
-sudo target/release/mirrorfs \
+sudo mirrorfs \
   --local /mnt/claude_local \
   --remote /mnt/claude_remote \
   --allow-other \
   /mnt/claude
 ```
+
+From a source checkout that has not been installed, use
+`target/release/mirrorfs` in place of `mirrorfs`.
 
 As a non-root user, `fusermount3` rejects `allow_other` unless
 `/etc/fuse.conf` contains a line `user_allow_other`. This repo does not change
