@@ -13,6 +13,6 @@ Each item is implemented, manually tested against `/mnt/claude_local` and
 - [x] Virtual `sys/` directory exposing stats, the remote queue, and errors
 - [x] Retry when the remote is temporarily unavailable; queue survives restart
 - [x] `--debug` logs path, operation, result, and whether it was queued
-- [ ] `--allow-other` for root mounts that other users must access (flag is wired; non-root rejection tested; root confirmation deferred)
+- [x] `--allow-other` for root mounts that other users must access
 - [x] SIGINT / SIGTERM unmounts and leaves the queue durable
 - [x] `cargo build --release` and final README pass

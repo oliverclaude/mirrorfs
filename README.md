@@ -108,6 +108,8 @@ mirrorfs op=write path=notes.txt result=ok queued=yes
 
 `allow_other` lets accounts other than the mounter use the filesystem. The
 kernel still enforces each file's mode, owner, and group (`default_permissions`).
+A file or directory created by another account is owned by that account on
+the local tree and on the remote.
 
 As root, `/etc/fuse.conf` does not need `user_allow_other`:
 
