@@ -125,6 +125,12 @@ plus the VFS flags listed in
 .I <local>/.mirrorfs\-queue/
 Persistent queue of operations waiting for the remote directory.
 The directory is hidden from the mount.
+A file of 8 MiB or less is stored in its queue record.
+A larger file is copied sparsely, in 1 MiB chunks, into a sibling
+.I .blob
+file before the queue lock is taken.
+Holes are not written out.
+The worker replays that blob the same way.
 .TP
 .I <mount>/sys/stats
 .TQ

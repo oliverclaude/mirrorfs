@@ -1775,11 +1775,7 @@ impl MirrorFs {
     fn sys_bytes(&self, ino: u64) -> Vec<u8> {
         match ino {
             sysfs::STATS => {
-                let depth = self
-                    .queue
-                    .pending()
-                    .map(|records| records.len())
-                    .unwrap_or(0);
+                let depth = self.queue.depth().unwrap_or(0);
                 self.counters.render_stats(depth as u64)
             }
             sysfs::QUEUE => match self.queue.pending() {

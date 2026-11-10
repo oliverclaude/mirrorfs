@@ -104,7 +104,7 @@ The binary is `target/release/mirrorfs`. It is dynamically linked against
 
 `packaging/build-deb.sh` builds the release binary and packs it as
 `dist/mirrorfs_<version>-4_<arch>.deb`. The package version follows
-`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-4`).
+`Cargo.toml` plus the Debian revision in that script (currently `0.1.0-5`).
 The package installs `/usr/bin/mirrorfs`, `man mirrorfs`, and
 `man fuse.mirrorfs`. Library dependencies are filled in by
 `dpkg-shlibdeps`. `fuse3` is added as well, because `fusermount3` is executed
@@ -123,14 +123,14 @@ MIRRORFS_CARGO_OFFLINE=1 packaging/build-deb.sh
 Install it on another machine with apt so the dependencies are pulled in:
 
 ```sh
-sudo apt-get install ./dist/mirrorfs_0.1.0-4_amd64.deb
+sudo apt-get install ./dist/mirrorfs_0.1.0-5_amd64.deb
 ```
 
 `dpkg -i` does not install dependencies. Install them first, then the package:
 
 ```sh
 sudo apt-get install fuse3 'libc6 (>= 2.39)' libgcc-s1
-sudo dpkg -i mirrorfs_0.1.0-4_amd64.deb
+sudo dpkg -i mirrorfs_0.1.0-5_amd64.deb
 ```
 
 The `.deb` built here is amd64 and needs glibc 2.39 or newer (`GLIBC_2.39`).
@@ -264,13 +264,19 @@ Location: `<local>/.mirrorfs-queue/`.
 | --- | --- |
 | `NNNNNNNNNNNNNNNNNNNN.op` | One queued operation. Lowest number is applied next. |
 | `*.op.tmp` | A record still being written. Ignored until it is renamed. |
+| `NNNNNNNNNNNNNNNNNNNN.blob` | Sparse copy of a file larger than 8 MiB. Removed when that copy record is finished. |
 | `base.log` | Paths mirrorfs has already created or fully copied on the remote, so later mutations do not snapshot the file again. |
 
-A base copy stores the local object's content and attributes inside its `.op`
-file at the moment the mutation is queued. The worker does not re-read the
-live local file for that copy, so a later mutation cannot change the bytes of
-an earlier snapshot. A repair does re-read the live local object for every
-other operation. An exchange is repaired by copying both local names and
+A file of 8 MiB or less is stored, with its attributes, inside its `.op`
+record. A larger file is copied into a sibling `.blob` before the queue lock
+is taken, in 1 MiB chunks, skipping holes (`SEEK_DATA` / `SEEK_HOLE`). The
+record itself stays small. The worker replays that blob the same way and does
+not read the live file for that copy, so a later mutation cannot change the
+bytes of an earlier snapshot. Known paths are kept in memory and rebuilt from
+record headers on startup, so a mutation does not read record bodies to
+decide whether a copy is needed. `<mount>/sys/stats` counts records without
+reading them. A repair of any other operation streams the live local object
+in the same chunks. An exchange is repaired by copying both local names and
 leaving them there: applying the exchange afterwards would swap them back.
 A plain rename moves the remote source when it is still present, so the
 names inside a directory move with it, and copies the local destination
@@ -324,8 +330,9 @@ directory is already there.
   Copying a directory still copies that directory only, not the names inside
   it. If the remote root cannot be stated, or the copy fails (permissions,
   a full disk), the record stays queued and the worker backs off from 200ms
-  up to 5s. The repair reads the live local file without the lock that
-  covers FUSE writes, so a write that arrives during the copy can race it.
+  up to 5s. The repair copies the live local file in 1 MiB chunks, skipping
+  holes, without the lock that covers FUSE writes, so a write that arrives
+  during the copy can race it.
   The queued mutation is still applied afterwards, and later records run
   in order.
 - A replayed create or write gets its timestamps when the remote call runs.
@@ -337,9 +344,11 @@ directory is already there.
   by the mounter are stamped from the local directory again, because adding
   the child updates the directory mtime. A parent owned by someone else is
   left unchanged.
-- The first mutation of a file the remote does not yet have reads the whole
-  local file into the queue. That copy is buffered in memory while it is
-  written to `.mirrorfs-queue/`.
+- The first mutation of a file the remote does not yet have copies that file.
+  Up to 8 MiB stays in the queue record. A larger file is streamed sparsely
+  into a `.blob` beside the queue and replayed from there in 1 MiB chunks.
+  The queue directory needs room for that blob until the copy finishes.
+  Filesystems without hole seeks are copied densely, still one chunk at a time.
 - Queue order is global, not per file. A retrying record holds up later
   records until it succeeds.
 - `chown` to a uid other than the mounter needs root (or `CAP_CHOWN`). If it

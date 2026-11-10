@@ -438,6 +438,19 @@ fn fix(local: &Path, remote: &Path, op: &Op) -> io::Result<()> {
             clear_conflict(&path, snap.kind)?;
             apply_copy(local, remote, snap)
         }
+        Op::CopyBlob(op) => {
+            let path = remote_path(remote, &op.path)?;
+            assert_child(remote, &path)?;
+            clear_conflict(&path, op.kind)?;
+            apply_copy_blob(local, remote, op)
+        }
+        Op::CopyStored(op) => {
+            let path = remote_path(remote, &op.snap.path)?;
+            assert_child(remote, &path)?;
+            clear_conflict(&path, op.snap.kind)?;
+            apply_copy_stored(local, remote, op)
+        }
+        Op::WriteStored(op) => apply_write_stored(remote, op),
         Op::Rename { from, to, flags } if *flags & libc::RENAME_EXCHANGE != 0 => {
             replace_from_local(local, remote, to)?;
             replace_from_local(local, remote, from)?;
@@ -570,6 +583,19 @@ fn fix_rmdir(remote: &Path, rel: &Path) -> io::Result<()> {
 fn replace_from_local(local: &Path, remote: &Path, rel: &Path) -> io::Result<()> {
     let remote_full = remote_path(remote, rel)?;
     assert_child(remote, &remote_full)?;
+    let local_full = local.join(rel);
+    let st = util::lstat(&local_full)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size as u64 > crate::queue::INLINE_LIMIT
+    {
+        return match stream_local_file(local, remote, rel, &local_full) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                remove_blocking(&remote_full, None)?;
+                stream_local_file(local, remote, rel, &local_full)
+            }
+            Err(err) => Err(err),
+        };
+    }
     let snap = crate::queue::snapshot(local, rel)?;
     clear_conflict(&remote_full, snap.kind)?;
     match apply_copy(local, remote, &snap) {
@@ -582,6 +608,26 @@ fn replace_from_local(local: &Path, remote: &Path, rel: &Path) -> io::Result<()>
         }
         Err(err) => Err(err),
     }
+}
+
+fn stream_local_file(local: &Path, remote: &Path, rel: &Path, src: &Path) -> io::Result<()> {
+    let remote_full = remote_path(remote, rel)?;
+    ensure_parents(local, remote, rel)?;
+    clear_conflict(&remote_full, ObjectKind::File)?;
+    crate::sparse::copy_sparse(src, &remote_full)?;
+    let st = util::lstat(src)?;
+    let xattrs = crate::queue::list_xattrs(src)?;
+    stamp_copied(
+        &remote_full,
+        st.st_mode & 0o7777,
+        st.st_uid,
+        st.st_gid,
+        (st.st_atime, st.st_atime_nsec),
+        (st.st_mtime, st.st_mtime_nsec),
+        &xattrs,
+        false,
+    )?;
+    restamp_parents(local, remote, rel)
 }
 
 fn clear_conflict(path: &Path, wanted: ObjectKind) -> io::Result<()> {
@@ -660,6 +706,9 @@ pub fn apply(local_root: &Path, remote_root: &Path, op: &Op) -> io::Result<()> {
         Op::Rmdir(path) => remove_dir(&remote_path(remote_root, path)?),
         Op::Fsync { path, datasync } => apply_fsync(&remote_path(remote_root, path)?, *datasync),
         Op::Copy(op) => apply_copy(local_root, remote_root, op),
+        Op::CopyBlob(op) => apply_copy_blob(local_root, remote_root, op),
+        Op::CopyStored(op) => apply_copy_stored(local_root, remote_root, op),
+        Op::WriteStored(op) => apply_write_stored(remote_root, op),
         Op::Rename { from, to, flags } => apply_rename(local_root, remote_root, from, to, *flags),
         Op::Link { from, to } => apply_link(local_root, remote_root, from, to),
         Op::Symlink {
@@ -868,17 +917,98 @@ fn apply_copy(local: &Path, remote: &Path, op: &Snapshot) -> io::Result<()> {
             create_node(&path, op.kind, mode, op.rdev)?;
         }
     }
-    if op.kind != ObjectKind::Symlink {
-        util::lchown_path(&path, op.uid, op.gid)?;
-        util::chmod_path(&path, mode)?;
-    } else {
-        util::lchown_path(&path, op.uid, op.gid)?;
-    }
-    let times = [timespec(op.atime), timespec(op.mtime)];
-    util::utimens_nofollow(&path, &times)?;
-    set_xattrs(&path, &op.xattrs)?;
+    stamp_copied(
+        &path,
+        mode,
+        op.uid,
+        op.gid,
+        op.atime,
+        op.mtime,
+        &op.xattrs,
+        op.kind == ObjectKind::Symlink,
+    )?;
     restamp_parents(local, remote, &op.path)?;
     Ok(())
+}
+
+fn apply_copy_blob(local: &Path, remote: &Path, op: &crate::queue::CopyBlob) -> io::Result<()> {
+    ensure_parents(local, remote, &op.path)?;
+    let path = remote_path(remote, &op.path)?;
+    crate::sparse::copy_sparse(&op.blob, &path)?;
+    stamp_copied(
+        &path,
+        op.mode & 0o7777,
+        op.uid,
+        op.gid,
+        op.atime,
+        op.mtime,
+        &op.xattrs,
+        false,
+    )?;
+    restamp_parents(local, remote, &op.path)
+}
+
+fn apply_copy_stored(local: &Path, remote: &Path, op: &crate::queue::CopyStored) -> io::Result<()> {
+    ensure_parents(local, remote, &op.snap.path)?;
+    let path = remote_path(remote, &op.snap.path)?;
+    let mode = op.snap.mode & 0o7777;
+    match op.snap.kind {
+        ObjectKind::File => {
+            let src = File::open(&op.file)?;
+            let dst = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            crate::sparse::copy_range(&src, op.offset, &dst, 0, op.len)?;
+            dst.sync_all()?;
+        }
+        ObjectKind::Dir => create_dir(&path, mode)?,
+        ObjectKind::Symlink => write_symlink(&path, &op.snap.symlink)?,
+        ObjectKind::Fifo | ObjectKind::Char | ObjectKind::Block | ObjectKind::Socket => {
+            create_node(&path, op.snap.kind, mode, op.snap.rdev)?;
+        }
+    }
+    stamp_copied(
+        &path,
+        mode,
+        op.snap.uid,
+        op.snap.gid,
+        op.snap.atime,
+        op.snap.mtime,
+        &op.snap.xattrs,
+        op.snap.kind == ObjectKind::Symlink,
+    )?;
+    restamp_parents(local, remote, &op.snap.path)
+}
+
+fn apply_write_stored(root: &Path, op: &crate::queue::WriteStored) -> io::Result<()> {
+    let path = remote_path(root, &op.path)?;
+    let dst = OpenOptions::new().write(true).open(&path)?;
+    let src = File::open(&op.file)?;
+    crate::sparse::copy_range(&src, op.data_off, &dst, op.offset, op.len)?;
+    dst.sync_all()
+}
+
+fn stamp_copied(
+    path: &Path,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime: (i64, i64),
+    mtime: (i64, i64),
+    xattrs: &[(Vec<u8>, Vec<u8>)],
+    symlink: bool,
+) -> io::Result<()> {
+    if symlink {
+        util::lchown_path(path, uid, gid)?;
+    } else {
+        util::lchown_path(path, uid, gid)?;
+        util::chmod_path(path, mode)?;
+    }
+    let times = [timespec(atime), timespec(mtime)];
+    util::utimens_nofollow(path, &times)?;
+    set_xattrs(path, xattrs)
 }
 
 /// Creating the new object updates ancestor directory mtimes. Put the local

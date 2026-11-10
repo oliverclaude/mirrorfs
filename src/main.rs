@@ -2,6 +2,7 @@ mod fs;
 mod inode;
 mod queue;
 mod remote_pin;
+mod sparse;
 mod sysfs;
 mod util;
 mod worker;
