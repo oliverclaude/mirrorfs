@@ -56,6 +56,7 @@ impl MirrorFs {
         remote: PathBuf,
         debug: bool,
         watch: Option<RemoteWatch>,
+        remote_rate: u64,
     ) -> io::Result<Self> {
         let st = util::lstat(&local)?;
         let queue = Arc::new(Queue::open(&local)?);
@@ -73,6 +74,7 @@ impl MirrorFs {
             Arc::clone(&counters),
             debug,
             watch,
+            remote_rate,
         )?;
         Ok(Self {
             local,

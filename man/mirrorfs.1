@@ -88,6 +88,32 @@ that filesystem.
 This option requires
 .BR \-\-remote\-fs .
 .TP
+.BI \-\-remote\-rate " rate"
+How fast the background copier may write to the remote directory.
+.BR 32M ,
+.BR 8M ,
+.BR 512K ,
+or a bare number of bytes per second.
+.BR K ,
+.BR M ,
+and
+.B G
+are multiples of 1024.
+The default is
+.BR 32M .
+.B 0
+removes the cap.
+The copier may send about one second of that rate immediately, then holds
+the average.
+It also runs at nice 19 and in the idle I/O class, so the container's own
+requests are preferred on the CPU and the local disk.
+The threads that serve the mount are not changed.
+While the cap is holding writes back,
+.I queue_depth
+in
+.I sys/stats
+rises and the local queue directory holds the backlog.
+.TP
 .BR \-d ", " \-\-debug
 Log every operation: path, name, result, and whether it was queued.
 .TP
@@ -116,8 +142,9 @@ That form also accepts
 .BR debug ,
 .BR foreground ,
 .BI remote\-fs= type\fR,
-and
 .BI remote\-check= duration\fR,
+and
+.BI remote\-rate= rate\fR,
 plus the VFS flags listed in
 .BR fuse.mirrorfs (8).
 .SH FILES

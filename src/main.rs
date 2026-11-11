@@ -1,5 +1,6 @@
 mod fs;
 mod inode;
+mod pace;
 mod queue;
 mod remote_pin;
 mod sparse;
@@ -53,6 +54,11 @@ struct Args {
     #[arg(long = "remote-check", value_name = "DURATION")]
     remote_check: Option<String>,
 
+    /// How fast the background copier may write to the remote.
+    /// `32M`, `8M`, `0` for no cap. The default is 32 MiB/s.
+    #[arg(long = "remote-rate", value_name = "RATE")]
+    remote_rate: Option<String>,
+
     /// Directory to mount on.
     mountpoint: PathBuf,
 }
@@ -68,6 +74,7 @@ struct Launch {
     foreground: bool,
     remote_fs: Vec<String>,
     remote_check: Option<String>,
+    remote_rate: u64,
     /// VFS flags from `-o`, forwarded to fusermount3. `nodev` and `nosuid`
     /// must be forwarded: dropping them leaves a root mount able to honor
     /// device nodes and set-id bits.
@@ -101,6 +108,14 @@ fn main() -> ExitCode {
     }
 
     let args = Args::parse();
+    let remote_rate = match args.remote_rate.as_deref().map(pace::parse_rate) {
+        None => pace::DEFAULT_RATE,
+        Some(Ok(rate)) => rate,
+        Some(Err(err)) => {
+            eprintln!("mirrorfs: {err}");
+            return ExitCode::from(1);
+        }
+    };
     serve(
         Launch {
             local: args.local,
@@ -112,6 +127,7 @@ fn main() -> ExitCode {
             foreground: true,
             remote_fs: args.remote_fs,
             remote_check: args.remote_check,
+            remote_rate,
             kernel_options: Vec::new(),
         },
         None,
@@ -163,6 +179,7 @@ fn serve(mut launch: Launch, ready: Option<libc::c_int>) -> ExitCode {
         paths.remote.clone(),
         launch.debug,
         watch,
+        launch.remote_rate,
     ) {
         Ok(fs) => fs,
         Err(err) => {
@@ -200,7 +217,7 @@ fn serve(mut launch: Launch, ready: Option<libc::c_int>) -> ExitCode {
     }
     notify_ready(ready);
     eprintln!(
-        "mirrorfs: mounted {} local={} remote={} debug={} allow_other={} allow_root={} remote_fs={}",
+        "mirrorfs: mounted {} local={} remote={} debug={} allow_other={} allow_root={} remote_fs={} remote_rate={}",
         mountpoint.display(),
         paths.local.display(),
         paths.remote.display(),
@@ -211,7 +228,8 @@ fn serve(mut launch: Launch, ready: Option<libc::c_int>) -> ExitCode {
             "-".to_string()
         } else {
             launch.remote_fs.join(":")
-        }
+        },
+        pace::format_rate(launch.remote_rate),
     );
     match session.run() {
         Ok(()) => {
@@ -354,6 +372,7 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
     let mut foreground = false;
     let mut remote_fs = Vec::new();
     let mut remote_check = None;
+    let mut remote_rate = None;
     let mut kernel_options = Vec::new();
     for opt in options {
         if opt.is_empty() || ignored_mount_option(&opt) || opt == "default_permissions" {
@@ -385,6 +404,14 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
                 ));
             }
             remote_check = Some(value.to_string());
+        } else if let Some(value) = opt.strip_prefix("remote-rate=") {
+            if remote_rate.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "remote-rate is set more than once",
+                ));
+            }
+            remote_rate = Some(pace::parse_rate(value)?);
         } else if opt == "auto_unmount" {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -420,6 +447,7 @@ fn fuse_launch(args: &[String]) -> io::Result<Launch> {
         foreground,
         remote_fs,
         remote_check,
+        remote_rate: remote_rate.unwrap_or(pace::DEFAULT_RATE),
         kernel_options,
     })
 }
@@ -689,6 +717,43 @@ mod tests {
         let err = fuse_launch(&owned).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("remote-check"));
+    }
+
+    #[test]
+    fn fstab_remote_rate_defaults_and_parses() {
+        let got = launch(&[
+            "/mnt/claude_local",
+            "/mnt/claude",
+            "-o",
+            "remote=/mnt/claude_remote",
+        ]);
+        assert_eq!(got.remote_rate, super::pace::DEFAULT_RATE);
+        let got = launch(&[
+            "/mnt/claude_local",
+            "/mnt/claude",
+            "-o",
+            "remote=/mnt/claude_remote,remote-rate=8M",
+        ]);
+        assert_eq!(got.remote_rate, 8 * 1024 * 1024);
+        let got = launch(&[
+            "/mnt/claude_local",
+            "/mnt/claude",
+            "-o",
+            "remote=/mnt/claude_remote,remote-rate=0",
+        ]);
+        assert_eq!(got.remote_rate, 0);
+    }
+
+    #[test]
+    fn fstab_rejects_a_bad_remote_rate() {
+        let owned = vec![
+            "/mnt/claude_local".to_string(),
+            "/mnt/claude".to_string(),
+            "-o".to_string(),
+            "remote=/mnt/claude_remote,remote-rate=fast".to_string(),
+        ];
+        let err = fuse_launch(&owned).unwrap_err();
+        assert!(err.to_string().contains("remote-rate"));
     }
 
     #[test]

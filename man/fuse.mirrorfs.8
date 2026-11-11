@@ -155,6 +155,26 @@ A match opens a directory fd on that mount and drains the queue through it.
 Requires
 .BR remote\-fs .
 .TP
+.BI remote\-rate= rate
+How fast the background copier may write to the remote directory.
+.BR 32M ,
+.BR 8M ,
+or a number of bytes per second.
+.BR K ,
+.BR M ,
+and
+.B G
+are multiples of 1024.
+The default is
+.BR 32M .
+.B 0
+removes the cap.
+The copier runs at nice 19 and in the idle I/O class either way.
+The threads that serve the mount do not.
+A cap below the container's write rate makes
+.I queue_depth
+rise. The backlog stays in the local queue directory.
+.TP
 .B allow_other
 Let every user access the filesystem.
 As root this does not need

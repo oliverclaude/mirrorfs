@@ -1,8 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,13 +25,17 @@ pub fn spawn(
     counters: Arc<Counters>,
     debug: bool,
     watch: Option<RemoteWatch>,
+    rate: u64,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("mirrorfs-remote".to_string())
         .spawn(move || {
             if let Some(watch) = watch {
-                run_watched(queue, local, remote, stop, counters, debug, watch);
+                run_watched(queue, local, remote, stop, counters, debug, watch, rate);
             } else {
+                // No check thread is spawned, so this thread can drop its
+                // priority before it copies anything.
+                crate::pace::engage(rate);
                 run(queue, local, remote, stop, counters, debug);
             }
         })
@@ -101,6 +104,7 @@ fn run_watched(
     counters: Arc<Counters>,
     debug: bool,
     watch: RemoteWatch,
+    rate: u64,
 ) {
     let gate = Arc::new(Gate::new());
     let probe_gate = Arc::clone(&gate);
@@ -110,6 +114,9 @@ fn run_watched(
         .name("mirrorfs-remote-check".to_string())
         .spawn(move || probe_loop(&probe_remote, watch, &probe_stop, &probe_gate))
         .expect("spawn remote check");
+    // The check thread inherits the priority in effect at spawn, so lower
+    // this thread only after that spawn.
+    crate::pace::engage(rate);
     let mut backoff = RETRY_MIN;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -904,12 +911,12 @@ fn apply_copy(local: &Path, remote: &Path, op: &Snapshot) -> io::Result<()> {
     let mode = op.mode & 0o7777;
     match op.kind {
         ObjectKind::File => {
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&path)?;
-            file.write_all(&op.data)?;
+            crate::pace::write_at(&file, 0, &op.data)?;
         }
         ObjectKind::Dir => create_dir(&path, mode)?,
         ObjectKind::Symlink => write_symlink(&path, &op.symlink)?,
@@ -1414,20 +1421,7 @@ fn log_skip_xattr(name: &CString, path: &Path) {
 fn apply_write(root: &Path, op: &WriteData) -> io::Result<()> {
     let path = remote_path(root, &op.path)?;
     let file = OpenOptions::new().write(true).open(&path)?;
-    let mut offset = op.offset;
-    let mut data = op.data.as_slice();
-    while !data.is_empty() {
-        let n = file.write_at(data, offset)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                ErrorKind::WriteZero,
-                "remote write made no progress",
-            ));
-        }
-        offset += n as u64;
-        data = &data[n..];
-    }
-    Ok(())
+    crate::pace::write_at(&file, op.offset, &op.data)
 }
 
 fn apply_setattr(root: &Path, op: &Setattr) -> io::Result<()> {
@@ -2160,6 +2154,7 @@ mod tests {
                 fs_types: vec![fs_type.to_string()],
                 every,
             }),
+            0,
         )
         .unwrap();
         (

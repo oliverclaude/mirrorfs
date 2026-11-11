@@ -62,6 +62,9 @@ pub fn copy_range(
             }
             wrote += n;
             dst_off += n as u64;
+            // The copier thread has a rate. A FUSE thread building a local
+            // queue blob leaves the limit unset, so this does not wait there.
+            crate::pace::consume(n as u64);
         }
         src_off += got as u64;
         len -= got as u64;
