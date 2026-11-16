@@ -154,6 +154,7 @@ pub fn parse_seq(data: &[u8]) -> Option<u64> {
     token.parse().ok()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn render_queue(records: &[(u64, Op)]) -> Vec<u8> {
     let mut out = String::new();
     for (seq, op) in records {
