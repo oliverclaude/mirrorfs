@@ -383,7 +383,8 @@ impl Filesystem for MirrorFs {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if sysfs::is_reserved(ino.0) {
             let path = Path::new(sysfs::rel_of(ino.0));
-            if !sysfs::is_file(ino.0) || flags.acc_mode() != OpenAccMode::O_RDONLY {
+            let writable = ino.0 == sysfs::DROP;
+            if !sysfs::is_file(ino.0) || (!writable && flags.acc_mode() != OpenAccMode::O_RDONLY) {
                 let errno = if sysfs::is_file(ino.0) {
                     Errno::EROFS
                 } else {
@@ -739,6 +740,10 @@ impl Filesystem for MirrorFs {
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        if ino.0 == sysfs::DROP {
+            self.write_drop(data, reply);
+            return;
+        }
         if sysfs::is_reserved(ino.0) {
             self.trace(
                 "write",
@@ -807,6 +812,12 @@ impl Filesystem for MirrorFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if ino.0 == sysfs::DROP {
+            // `echo N > sys/drop` opens with O_TRUNC, which sets the size
+            // to zero before the write. The file has no stored bytes.
+            self.reply_sys_attr("setattr", ino.0, reply);
+            return;
+        }
         if sysfs::is_reserved(ino.0) {
             self.trace(
                 "setattr",
@@ -1729,6 +1740,11 @@ impl MirrorFs {
                 name: OsString::from("queue"),
             },
             DirEntry {
+                ino: sysfs::DROP,
+                kind: FileType::RegularFile,
+                name: OsString::from("drop"),
+            },
+            DirEntry {
                 ino: sysfs::ERRORS,
                 kind: FileType::RegularFile,
                 name: OsString::from("errors"),
@@ -1764,7 +1780,13 @@ impl MirrorFs {
             } else {
                 FileType::RegularFile
             },
-            perm: if ino == sysfs::DIR { 0o555 } else { 0o444 },
+            perm: if ino == sysfs::DIR {
+                0o555
+            } else if ino == sysfs::DROP {
+                0o644
+            } else {
+                0o444
+            },
             nlink: if ino == sysfs::DIR { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -1780,15 +1802,42 @@ impl MirrorFs {
                 let depth = self.queue.depth().unwrap_or(0);
                 self.counters.render_stats(depth as u64)
             }
-            sysfs::QUEUE => match self.queue.pending() {
-                Ok(records) => sysfs::render_queue(&records),
+            sysfs::QUEUE => match self.queue.listing() {
+                Ok(bytes) => bytes,
                 Err(err) => {
                     self.counters.note_error(format!("queue list: {err}"));
                     format!("queue list failed: {err}\n").into_bytes()
                 }
             },
+            sysfs::DROP => b"write the leading sequence number from sys/queue\n".to_vec(),
             sysfs::ERRORS => self.counters.render_errors(),
             _ => Vec::new(),
+        }
+    }
+
+    fn write_drop(&self, data: &[u8], reply: fuser::ReplyWrite) {
+        let Some(seq) = sysfs::parse_seq(data) else {
+            self.trace("write", Path::new("sys/drop"), &errno_label(Errno::EINVAL));
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.queue.drop_seq(seq) {
+            Ok(true) => {
+                eprintln!("mirrorfs: dropped queue seq={seq}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                self.log("write", Path::new("sys/drop"), "ok", false);
+                reply.written(data.len() as u32);
+            }
+            Ok(false) => {
+                self.trace("write", Path::new("sys/drop"), &errno_label(Errno::ENOENT));
+                reply.error(Errno::ENOENT);
+            }
+            Err(err) => {
+                self.counters.note_error(format!("queue drop {seq}: {err}"));
+                let errno = Errno::from(err);
+                self.trace("write", Path::new("sys/drop"), &errno_label(errno));
+                reply.error(errno);
+            }
         }
     }
 }

@@ -21,16 +21,17 @@ pub const DIR: u64 = u64::MAX - 16;
 pub const STATS: u64 = u64::MAX - 15;
 pub const QUEUE: u64 = u64::MAX - 14;
 pub const ERRORS: u64 = u64::MAX - 13;
+pub const DROP: u64 = u64::MAX - 12;
 pub const NAME: &str = "sys";
 
 const ERROR_CAP: usize = 64;
 
 pub fn is_reserved(ino: u64) -> bool {
-    matches!(ino, DIR | STATS | QUEUE | ERRORS)
+    matches!(ino, DIR | STATS | QUEUE | ERRORS | DROP)
 }
 
 pub fn is_file(ino: u64) -> bool {
-    matches!(ino, STATS | QUEUE | ERRORS)
+    matches!(ino, STATS | QUEUE | ERRORS | DROP)
 }
 
 pub fn rel_of(ino: u64) -> &'static str {
@@ -39,6 +40,7 @@ pub fn rel_of(ino: u64) -> &'static str {
         STATS => "sys/stats",
         QUEUE => "sys/queue",
         ERRORS => "sys/errors",
+        DROP => "sys/drop",
         _ => "sys",
     }
 }
@@ -55,6 +57,7 @@ pub fn child(parent: u64, name: &OsStr) -> Option<u64> {
         Some("stats") => Some(STATS),
         Some("queue") => Some(QUEUE),
         Some("errors") => Some(ERRORS),
+        Some("drop") => Some(DROP),
         _ => None,
     }
 }
@@ -144,6 +147,13 @@ impl Counters {
     }
 }
 
+/// First token of a `sys/drop` write. A pasted `sys/queue` line is accepted.
+pub fn parse_seq(data: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(data).ok()?;
+    let token = text.split_whitespace().next()?;
+    token.parse().ok()
+}
+
 pub fn render_queue(records: &[(u64, Op)]) -> Vec<u8> {
     let mut out = String::new();
     for (seq, op) in records {
@@ -211,5 +221,13 @@ mod tests {
         let text = String::from_utf8(render_queue(&records)).unwrap();
         assert_eq!(text, "7 rename a -> b flags=0\n");
         assert!(render_queue(&[]).is_empty());
+    }
+
+    #[test]
+    fn drop_accepts_the_leading_sequence_number() {
+        assert_eq!(parse_seq(b"7\n"), Some(7));
+        assert_eq!(parse_seq(b"  7 rename a -> b flags=0\n"), Some(7));
+        assert_eq!(parse_seq(b"\n"), None);
+        assert_eq!(parse_seq(b"rename\n"), None);
     }
 }

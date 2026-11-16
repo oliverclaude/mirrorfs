@@ -18,7 +18,7 @@ if [ -z "$version" ]; then
     echo "mirrorfs: version missing from Cargo.toml" >&2
     exit 1
 fi
-revision=6
+revision=7
 arch=$(dpkg --print-architecture)
 pkgver="${version}-${revision}"
 debname="mirrorfs_${pkgver}_${arch}.deb"
