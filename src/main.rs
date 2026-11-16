@@ -1,3 +1,4 @@
+mod dirty;
 mod fs;
 mod inode;
 mod pace;

@@ -112,6 +112,50 @@ fn copy_extents(src: &File, dst: &File, len: u64) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Copy the window `[start, start+len)` , keeping holes inside it.
+///
+/// A dirty 1 MiB block is copied from the live file. Ext4 reports an
+/// unwritten extent as a hole, so a fallocate that only reserves space is
+/// still skipped here. The dirty file records that fallocate separately.
+pub fn copy_window(src: &File, dst: &File, start: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = start.saturating_add(len);
+    let mut offset = start;
+    loop {
+        let data = match lseek(src, offset, libc::SEEK_DATA) {
+            Ok(data) => data,
+            Err(err) if unsupported(&err) && offset == start => {
+                return copy_range(src, start, dst, start, len);
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if data >= end {
+            return Ok(());
+        }
+        let hole = match lseek(src, data, libc::SEEK_HOLE) {
+            Ok(hole) => hole.min(end),
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => end,
+            Err(err) if unsupported(&err) => end,
+            Err(err) => return Err(err),
+        };
+        let hole = hole.max(data);
+        if hole > data {
+            copy_range(src, data, dst, data, hole - data)?;
+        }
+        if hole >= end {
+            return Ok(());
+        }
+        offset = if hole == data {
+            data.saturating_add(1)
+        } else {
+            hole
+        };
+    }
+}
+
 fn lseek(file: &File, offset: u64, whence: i32) -> io::Result<u64> {
     let rc = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
     if rc < 0 {

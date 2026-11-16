@@ -152,16 +152,23 @@ plus the VFS flags listed in
 .I <local>/.mirrorfs\-queue/
 Persistent queue of operations waiting for the remote directory.
 The directory is hidden from the mount.
-A file of 8 MiB or less is stored in its queue record.
-A larger file is copied sparsely, in 1 MiB chunks, into a sibling
+A regular file the remote does not yet have is queued as one live copy
+of the local file.
+A regular file the remote already has records changed 1 MiB blocks in a
+.I .dirty
+file, and the copier reads those ranges from the live local file.
+Directories, symlinks, and device nodes stay inline in the
+.I .op
+record.
+An older record that already stored a full copy, inline or in a
 .I .blob
-file before the queue lock is taken.
-Holes are not written out.
-The worker replays that blob the same way.
+file, is still applied from those bytes.
 .TP
 .I <mount>/sys/stats
 .TQ
 .I <mount>/sys/queue
+.TQ
+.I <mount>/sys/drop
 .TQ
 .I <mount>/sys/errors
 Userspace status files.
@@ -171,7 +178,23 @@ The directory is omitted from listings of the mount root, including
 Opening
 .I <mount>/sys
 still works, and the files inside are listed once it is open.
-The directory is mode 0555 and the files are mode 0444.
+The directory is mode 0555.
+.IR stats ,
+.IR queue ,
+and
+.I errors
+are mode 0444.
+.I drop
+is mode 0644, so only the user who mounted the filesystem can write it.
+Write a sequence number from
+.I sys/queue
+to drop that item without applying it.
+A pasted queue line is accepted and the first number is used.
+An unknown number fails with
+.BR ENOENT .
+Dropping a copy that has not reached the remote leaves that path unknown.
+Dropping dirty blocks leaves the remote file as it was.
+Dropping an unlink, rmdir, rename, or link leaves the two trees different.
 .TP
 .I /var/log/mirrorfs.log
 Log for a daemonized mount.

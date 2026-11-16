@@ -49,6 +49,19 @@ pub fn lstat(path: &Path) -> io::Result<libc::stat> {
     }
 }
 
+/// Follow a symlink. The copier's remote root is `/proc/self/fd/N`, and
+/// `lstat` of that path sees the symlink rather than the mounted directory.
+pub fn stat(path: &Path) -> io::Result<libc::stat> {
+    let c = cstring(path)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::stat(c.as_ptr(), &mut st) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(st)
+    }
+}
+
 pub fn cstring(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(

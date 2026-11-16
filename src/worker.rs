@@ -136,9 +136,26 @@ fn run_watched(
             }
         };
         let Some((seq, op)) = head else {
-            backoff = RETRY_MIN;
-            wait(&stop, RETRY_MIN);
-            continue;
+            match take_dirty(&queue, &local, &remote_root, &counters, debug) {
+                DirtyOutcome::Progress => {
+                    backoff = RETRY_MIN;
+                    continue;
+                }
+                DirtyOutcome::Idle => {
+                    backoff = RETRY_MIN;
+                    wait(&stop, RETRY_MIN);
+                    continue;
+                }
+                DirtyOutcome::Lost => {
+                    gate.clear();
+                    continue;
+                }
+                DirtyOutcome::Retry => {
+                    wait(&stop, backoff);
+                    backoff = grow(backoff);
+                    continue;
+                }
+            }
         };
         let recovered = match apply(&local, &remote_root, &op) {
             Ok(()) => None,
@@ -160,6 +177,17 @@ fn run_watched(
                             gate.clear();
                             continue;
                         }
+                        match take_dirty(&queue, &local, &remote_root, &counters, debug) {
+                            DirtyOutcome::Progress => {
+                                backoff = RETRY_MIN;
+                                continue;
+                            }
+                            DirtyOutcome::Lost => {
+                                gate.clear();
+                                continue;
+                            }
+                            DirtyOutcome::Idle | DirtyOutcome::Retry => {}
+                        }
                         log_retry(&op, &err);
                         counters.note_remote_retry(retry_message(&op, &err));
                         wait(&stop, backoff);
@@ -171,6 +199,17 @@ fn run_watched(
                             note_lost(&counters, &op, &fix_err);
                             gate.clear();
                             continue;
+                        }
+                        match take_dirty(&queue, &local, &remote_root, &counters, debug) {
+                            DirtyOutcome::Progress => {
+                                backoff = RETRY_MIN;
+                                continue;
+                            }
+                            DirtyOutcome::Lost => {
+                                gate.clear();
+                                continue;
+                            }
+                            DirtyOutcome::Idle | DirtyOutcome::Retry => {}
                         }
                         log_retry(&op, &fix_err);
                         counters.note_remote_retry(retry_message(&op, &fix_err));
@@ -317,9 +356,22 @@ fn run(
             }
         };
         let Some((seq, op)) = head else {
-            backoff = RETRY_MIN;
-            wait(&stop, RETRY_MIN);
-            continue;
+            match take_dirty(&queue, &local, &remote, &counters, debug) {
+                DirtyOutcome::Progress => {
+                    backoff = RETRY_MIN;
+                    continue;
+                }
+                DirtyOutcome::Idle => {
+                    backoff = RETRY_MIN;
+                    wait(&stop, RETRY_MIN);
+                    continue;
+                }
+                DirtyOutcome::Lost | DirtyOutcome::Retry => {
+                    wait(&stop, backoff);
+                    backoff = grow(backoff);
+                    continue;
+                }
+            }
         };
         let recovered = match apply(&local, &remote, &op) {
             Ok(()) => None,
@@ -331,6 +383,13 @@ fn run(
                 match repair(&local, &remote, &op, &err) {
                     Repair::Done => Some(err),
                     Repair::Unchanged => {
+                        match take_dirty(&queue, &local, &remote, &counters, debug) {
+                            DirtyOutcome::Progress => {
+                                backoff = RETRY_MIN;
+                                continue;
+                            }
+                            DirtyOutcome::Idle | DirtyOutcome::Retry | DirtyOutcome::Lost => {}
+                        }
                         log_retry(&op, &err);
                         counters.note_remote_retry(retry_message(&op, &err));
                         wait(&stop, backoff);
@@ -338,6 +397,13 @@ fn run(
                         continue;
                     }
                     Repair::Failed(fix_err) => {
+                        match take_dirty(&queue, &local, &remote, &counters, debug) {
+                            DirtyOutcome::Progress => {
+                                backoff = RETRY_MIN;
+                                continue;
+                            }
+                            DirtyOutcome::Idle | DirtyOutcome::Retry | DirtyOutcome::Lost => {}
+                        }
                         log_retry(&op, &fix_err);
                         counters.note_remote_retry(retry_message(&op, &fix_err));
                         wait(&stop, backoff);
@@ -423,9 +489,99 @@ fn repair(local: &Path, remote: &Path, op: &Op, err: &io::Error) -> Repair {
 }
 
 fn mount_available(remote_root: &Path) -> bool {
-    match util::lstat(remote_root) {
+    // `stat` follows the symlink. The watched copier publishes the remote
+    // as `/proc/self/fd/N`, and `lstat` of that path is the symlink itself.
+    match util::stat(remote_root) {
         Ok(st) => st.st_mode & libc::S_IFMT == libc::S_IFDIR,
         Err(_) => false,
+    }
+}
+
+enum DirtyOutcome {
+    /// One dirty file was copied, or its generation moved during the copy.
+    Progress,
+    /// Nothing dirty is eligible.
+    Idle,
+    /// The copy failed and the dirty file is still there.
+    Retry,
+    /// The remote mount is gone. The watched loop drops its pin.
+    Lost,
+}
+
+/// Copy the oldest dirty file that is not covered by a journal record.
+///
+/// Never called while the watched pin is down: the caller only reaches
+/// here with a live remote root. A failure leaves the dirty file in place.
+fn take_dirty(
+    queue: &Queue,
+    local: &Path,
+    remote: &Path,
+    counters: &Counters,
+    debug: bool,
+) -> DirtyOutcome {
+    if !mount_available(remote) {
+        eprintln!(
+            "mirrorfs: remote mount lost op=dirty path={} result=remote is not a directory",
+            remote.display()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        counters.note_remote_retry(format!(
+            "remote op=dirty path={} result=remote is not a directory",
+            remote.display()
+        ));
+        return DirtyOutcome::Lost;
+    }
+    let Some(job) = queue.next_dirty() else {
+        return DirtyOutcome::Idle;
+    };
+    match apply_dirty(local, remote, &job) {
+        Ok(()) => match queue.ack_dirty(job.seq, job.generation) {
+            Ok(_) => {
+                counters.note_remote_ok();
+                if debug {
+                    eprintln!(
+                        "mirrorfs remote op=dirty path={} result=ok",
+                        job.path.display()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                DirtyOutcome::Progress
+            }
+            Err(err) => {
+                counters.note_error(format!(
+                    "queue ack dirty {} path={} result={err}",
+                    job.seq,
+                    job.path.display()
+                ));
+                eprintln!("mirrorfs: queue ack dirty {} failed: {err}", job.seq);
+                DirtyOutcome::Retry
+            }
+        },
+        Err(err) => {
+            if remote_lost(&err) || !mount_available(remote) {
+                eprintln!(
+                    "mirrorfs: remote mount lost op=dirty path={} result={err}",
+                    job.path.display()
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                counters.note_remote_retry(format!(
+                    "remote op=dirty path={} result={err}",
+                    job.path.display()
+                ));
+                DirtyOutcome::Lost
+            } else {
+                eprintln!(
+                    "mirrorfs remote op=dirty path={} result={err} retry",
+                    job.path.display()
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                counters.note_remote_retry(format!(
+                    "remote op=dirty path={} result={err}",
+                    job.path.display()
+                ));
+                DirtyOutcome::Retry
+            }
+        }
     }
 }
 
@@ -457,6 +613,7 @@ fn fix(local: &Path, remote: &Path, op: &Op) -> io::Result<()> {
             clear_conflict(&path, op.snap.kind)?;
             apply_copy_stored(local, remote, op)
         }
+        Op::CopyLive { path } => apply_copy_live(local, remote, path),
         Op::WriteStored(op) => apply_write_stored(remote, op),
         Op::Rename { from, to, flags } if *flags & libc::RENAME_EXCHANGE != 0 => {
             replace_from_local(local, remote, to)?;
@@ -583,6 +740,109 @@ fn fix_rmdir(remote: &Path, rel: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotADirectory => remove_file(&full),
         Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => remove_blocking(&full, None),
+        Err(err) => Err(err),
+    }
+}
+
+fn apply_copy_live(local: &Path, remote: &Path, rel: &Path) -> io::Result<()> {
+    let local_full = local.join(rel);
+    let st = util::lstat(&local_full)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return replace_from_local(local, remote, rel);
+    }
+    stream_local_over(local, remote, rel, &local_full)
+}
+
+/// Copy one dirty generation from the live local file.
+///
+/// A missing remote file, or a dirty set marked whole, is streamed in full.
+/// Otherwise reserved extents are replayed, live metadata is applied when
+/// asked, and each dirty 1 MiB block is copied. The remote file is synced
+/// only when the guest fsynced. The caller drops the dirty file when the
+/// generation is still the one that was copied.
+pub fn apply_dirty(local: &Path, remote: &Path, job: &crate::dirty::Job) -> io::Result<()> {
+    let local_full = local.join(&job.path);
+    let st = util::lstat(&local_full)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} is not a regular file", local_full.display()),
+        ));
+    }
+    let remote_full = remote_path(remote, &job.path)?;
+    assert_child(remote, &remote_full)?;
+    let remote_is_file = match util::lstat(&remote_full) {
+        Ok(remote_st) => remote_st.st_mode & libc::S_IFMT == libc::S_IFREG,
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    if !remote_is_file || job.whole {
+        return stream_local_over(local, remote, &job.path, &local_full);
+    }
+    for falloc in &job.fallocs {
+        apply_fallocate(remote, &job.path, falloc.offset, falloc.length, falloc.mode)?;
+    }
+    if job.meta {
+        apply_live_meta(&local_full, &remote_full, &st)?;
+    }
+    let file_len = util::lstat(&local_full)?.st_size as u64;
+    let src = File::open(&local_full)?;
+    let dst = OpenOptions::new().write(true).open(&remote_full)?;
+    for block in &job.blocks {
+        let start = block.saturating_mul(crate::dirty::BLOCK);
+        if start >= file_len {
+            continue;
+        }
+        let len = crate::dirty::BLOCK.min(file_len - start);
+        crate::sparse::copy_window(&src, &dst, start, len)?;
+    }
+    if job.sync {
+        dst.sync_all()?;
+    }
+    Ok(())
+}
+
+fn apply_live_meta(local_full: &Path, remote_full: &Path, st: &libc::stat) -> io::Result<()> {
+    util::lchown_path(remote_full, st.st_uid, st.st_gid)?;
+    util::chmod_path(remote_full, st.st_mode & 0o7777)?;
+    OpenOptions::new()
+        .write(true)
+        .open(remote_full)?
+        .set_len(st.st_size as u64)?;
+    let times = [
+        timespec((st.st_atime, st.st_atime_nsec)),
+        timespec((st.st_mtime, st.st_mtime_nsec)),
+    ];
+    util::utimens_nofollow(remote_full, &times)?;
+    let local_xattrs = crate::queue::list_xattrs(local_full)?;
+    let remote_xattrs = crate::queue::list_xattrs(remote_full)?;
+    for (name, _) in &remote_xattrs {
+        if local_xattrs.iter().any(|(have, _)| have == name) {
+            continue;
+        }
+        let path_c = util::cstring(remote_full)?;
+        let name_c = xattr_name(name)?;
+        let rc = unsafe { libc::lremovexattr(path_c.as_ptr(), name_c.as_ptr()) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENODATA) || is_unsupported(&err) {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    set_xattrs(remote_full, &local_xattrs)
+}
+
+fn stream_local_over(local: &Path, remote: &Path, rel: &Path, src: &Path) -> io::Result<()> {
+    let remote_full = remote_path(remote, rel)?;
+    assert_child(remote, &remote_full)?;
+    match stream_local_file(local, remote, rel, src) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            remove_blocking(&remote_full, None)?;
+            stream_local_file(local, remote, rel, src)
+        }
         Err(err) => Err(err),
     }
 }
@@ -715,6 +975,7 @@ pub fn apply(local_root: &Path, remote_root: &Path, op: &Op) -> io::Result<()> {
         Op::Copy(op) => apply_copy(local_root, remote_root, op),
         Op::CopyBlob(op) => apply_copy_blob(local_root, remote_root, op),
         Op::CopyStored(op) => apply_copy_stored(local_root, remote_root, op),
+        Op::CopyLive { path } => apply_copy_live(local_root, remote_root, path),
         Op::WriteStored(op) => apply_write_stored(remote_root, op),
         Op::Rename { from, to, flags } => apply_rename(local_root, remote_root, from, to, *flags),
         Op::Link { from, to } => apply_link(local_root, remote_root, from, to),
@@ -2080,6 +2341,45 @@ mod tests {
             repair(&local, &remote, &bad, &err),
             Repair::Unchanged
         ));
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn mount_available_follows_a_directory_symlink() {
+        let (local, remote) = scratch("fix-mount-link");
+        let link = local.join("pin");
+        std::os::unix::fs::symlink(&remote, &link).unwrap();
+        assert!(mount_available(&link));
+        let missing = local.join("missing-pin");
+        std::os::unix::fs::symlink(remote.join("no-such-dir"), &missing).unwrap();
+        assert!(!mount_available(&missing));
+        let _ = fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[test]
+    fn dirty_metadata_updates_mode_and_size() {
+        let (local, remote) = scratch("dirty-meta");
+        fs::write(local.join("a.txt"), b"hello").unwrap();
+        fs::write(remote.join("a.txt"), b"helloXXX").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(local.join("a.txt")).unwrap().permissions();
+        perms.set_mode(0o640);
+        fs::set_permissions(local.join("a.txt"), perms).unwrap();
+        let job = crate::dirty::Job {
+            seq: 1,
+            path: PathBuf::from("a.txt"),
+            generation: 1,
+            meta: true,
+            sync: false,
+            whole: false,
+            blocks: Vec::new(),
+            fallocs: Vec::new(),
+        };
+        apply_dirty(&local, &remote, &job).unwrap();
+        let st = util::lstat(&remote.join("a.txt")).unwrap();
+        assert_eq!(st.st_size, 5);
+        assert_eq!(st.st_mode & 0o777, 0o640);
+        assert_eq!(fs::read(remote.join("a.txt")).unwrap(), b"hello");
         let _ = fs::remove_dir_all(local.parent().unwrap());
     }
 

@@ -270,25 +270,47 @@ Location: `<local>/.mirrorfs-queue/`.
 
 | Entry | Role |
 | --- | --- |
-| `NNNNNNNNNNNNNNNNNNNN.op` | One queued operation. Lowest number is applied next. |
+| `NNNNNNNNNNNNNNNNNNNN.op` | One ordered operation: create, unlink, rmdir, rename, link, symlink, or a live whole-copy of a regular file the remote has never had. Lowest number is applied next. |
 | `*.op.tmp` | A record still being written. Ignored until it is renamed. |
-| `NNNNNNNNNNNNNNNNNNNN.blob` | Sparse copy of a file larger than 8 MiB. Removed when that copy record is finished. |
-| `base.log` | Paths mirrorfs has already created or fully copied on the remote, so later mutations do not snapshot the file again. |
+| `NNNNNNNNNNNNNNNNNNNN.dirty` | Dirty 1 MiB blocks, a metadata bit, and an fsync bit for one regular file the remote already has. |
+| `*.dirty.tmp` | A dirty file still being written. Ignored until it is renamed. |
+| `NNNNNNNNNNNNNNNNNNNN.blob` | Sparse copy stored by an older record. New copies do not add blobs. Removed when that record is finished or dropped. |
+| `base.log` | Paths mirrorfs has already created or fully copied on the remote. |
 
-A file of 8 MiB or less is stored, with its attributes, inside its `.op`
-record. A larger file is copied into a sibling `.blob` before the queue lock
-is taken, in 1 MiB chunks, skipping holes (`SEEK_DATA` / `SEEK_HOLE`). The
-record itself stays small. The worker replays that blob the same way and does
-not read the live file for that copy, so a later mutation cannot change the
-bytes of an earlier snapshot. Known paths are kept in memory and rebuilt from
-record headers on startup, so a mutation does not read record bodies to
-decide whether a copy is needed. `<mount>/sys/stats` counts records without
-reading them. A repair of any other operation streams the live local object
-in the same chunks. An exchange is repaired by copying both local names and
-leaving them there: applying the exchange afterwards would swap them back.
-A plain rename moves the remote source when it is still present, so the
-names inside a directory move with it, and copies the local destination
-only when that source is gone.
+A guest write to a regular file the remote already has sets dirty bits and
+returns. It does not append another `.op`. The dirty file is written to a
+temp file, fsynced, renamed, and the directory is fsynced before the write
+returns. The copier later reads those 1 MiB ranges from the live local file.
+A metadata change (mode, owner, size, times, xattrs) sets a metadata bit and
+is applied from the live file. An fsync sets a sync bit, and the copier syncs
+the remote file after the ranges. `fallocate` is stored on the dirty file and
+replayed, because an unwritten extent still looks like a hole to `SEEK_HOLE`.
+
+A regular file the remote is not known to have is one live whole-copy record
+(`copy <path> live`). The bytes stay in the local file. The copier streams
+them with `SEEK_DATA` / `SEEK_HOLE` when the remote is up. Later writes to
+that path update the dirty map instead of queueing another copy. Directories,
+symlinks, and device nodes stay inline in the `.op` record. A copy record
+already on disk, inline or in a `.blob`, is still applied from the bytes it
+stored.
+
+Namespace operations stay in order. While one of them covers a path, further
+changes to that path are journal records too, so a rename cannot be overtaken
+by a dirty copy of the same path. A dirty file's path moves with a rename
+that reaches the remote. A failing rename does not block dirty copies of
+other files. Copy records do not block the dirty map.
+
+Known paths are kept in memory and rebuilt from the journal when mirrorfs
+starts. `base.log` is updated when a record is finished. Dropping a record
+does not write it into `base.log`. `<mount>/sys/stats` `queue_depth` counts
+`.op` records plus dirty files, one dirty file as one, and does not read
+record bodies. `<mount>/sys/queue` lists each item as `<sequence> <text>`
+without reading write payloads. A repair of any other operation streams the
+live local object in 1 MiB chunks. An exchange is repaired by copying both
+local names and leaving them there: applying the exchange afterwards would
+swap them back. A plain rename moves the remote source when it is still
+present, so the names inside a directory move with it, and copies the local
+destination only when that source is gone.
 
 While the worker is retrying, new FUSE calls still complete against the local
 directory and append to the queue.
@@ -303,24 +325,35 @@ the directory is open:
 ```text
 <mount>/sys/stats
 <mount>/sys/queue
+<mount>/sys/drop
 <mount>/sys/errors
 ```
 
 | File | Contents |
 | --- | --- |
 | `stats` | `uptime_ms`, `fuse_ok`, `fuse_errors`, `remote_ok`, `remote_retries`, `queue_depth` |
-| `queue` | One line per record still waiting: sequence number, then the operation. Empty when nothing is queued. |
+| `queue` | One line per journal record or dirty file still waiting: sequence number, then the operation. Empty when nothing is queued. |
+| `drop` | Write the sequence number from the front of a `queue` line to remove that item. A pasted `queue` line is accepted. The item is not applied. |
 | `errors` | Remote apply failures and queue read or append failures. The newest 64 distinct messages are kept. Repeating the latest message refreshes its timestamp instead of adding a line. |
 
 `fuse_errors` counts FUSE results other than success, including an ordinary
 miss such as `ENOENT`. `remote_retries` counts attempts that left the record
 queued. A failure that the worker repaired is listed in `errors` with
 `recovered` and is not added to `remote_retries`. The directory is mode
-`0555` and the files are mode `0444`, owned by the user who mounted the
-filesystem. The kernel then denies writes with
-`EACCES`. A change that reaches mirrorfs, such as removing the directory,
-returns `EROFS`. Creating the name `sys` at the mount root fails because that
-directory is already there.
+`0555`. `stats`, `queue`, and `errors` are mode `0444`. `drop` is mode
+`0644`, owned by the user who mounted the filesystem, so another user
+allowed in by `allow_other` cannot write it. The kernel denies other writes
+with `EACCES`. A change that reaches mirrorfs, such as removing the
+directory, returns `EROFS`. An unknown sequence number written to `drop`
+returns `ENOENT`. Creating the name `sys` at the mount root fails because
+that directory is already there.
+
+Dropping dirty ranges leaves the remote file on its older copy. The path
+stays known, so the next write updates the dirty map instead of copying the
+whole file again. Dropping a whole-copy that has not landed leaves the path
+unknown, so the next mutation copies the local file. Dropping an unlink,
+rmdir, rename, or link does not make the two trees match. Do not delete
+`.op` or `.dirty` files by hand.
 
 ## Known limitations
 
@@ -331,7 +364,8 @@ directory is already there.
   at enqueue time. If applying that mutation fails while the remote
   directory can still be stated, the worker copies the live local object
   over the remote path and applies the queued operation once more. A queued
-  copy is replayed from the bytes stored in the record. An exchange copies
+  copy that already stored its bytes is replayed from those bytes. A live
+  copy is streamed from the local file. An exchange copies
   both local names and does not swap them again. A plain rename moves the
   remote source when that source still exists. Unlink and rmdir remove a
   conflicting remote node, including a non-empty directory at that path.
@@ -352,13 +386,16 @@ directory is already there.
   by the mounter are stamped from the local directory again, because adding
   the child updates the directory mtime. A parent owned by someone else is
   left unchanged.
-- The first mutation of a file the remote does not yet have copies that file.
-  Up to 8 MiB stays in the queue record. A larger file is streamed sparsely
-  into a `.blob` beside the queue and replayed from there in 1 MiB chunks.
-  The queue directory needs room for that blob until the copy finishes.
-  Filesystems without hole seeks are copied densely, still one chunk at a time.
-- Queue order is global, not per file. A retrying record holds up later
-  records until it succeeds.
+- The first mutation of a regular file the remote does not yet have queues
+  one live copy. The bytes stay in the local file and are streamed, skipping
+  holes, when the remote is up. A file the remote already has records changed
+  1 MiB blocks instead. Filesystems without hole seeks are copied densely,
+  still one chunk at a time. An older `.blob` already in the queue is still
+  replayed from that blob.
+- Namespace records stay in order. A retrying unlink, rmdir, rename, link,
+  symlink, or create holds up later namespace records until it succeeds.
+  Dirty copies of other files still run. Writes to the path a stuck record
+  covers stay behind that record.
 - `chown` to a uid other than the mounter needs root (or `CAP_CHOWN`). If it
   fails, the failure is retried, which stalls the queue until it can succeed.
 - Extended attributes that the remote filesystem rejects with `ENOTSUP` are
@@ -398,7 +435,8 @@ path mirrorfs has not already created or copied is preceded by a snapshot of
 that local object. Rename, link, symlink, xattr, and fallocate are applied
 locally and queued the same way. A rename of a tree mirrorfs already knows
 moves that tree on the remote. A rename of a path it does not know copies
-the local object at its new path. `<mount>/sys/stats`, `sys/queue`, and
-`sys/errors` report counters, the records still waiting, and recent remote
-or queue failures. A remote error while that directory is still reachable
+the local object at its new path. `<mount>/sys/stats`, `sys/queue`,
+`sys/drop`, and `sys/errors` report counters, the records still waiting, a
+way to drop one sequence number, and recent remote or queue failures.
+A remote error while that directory is still reachable
 is repaired by copying the local object and applying the operation again.

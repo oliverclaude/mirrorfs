@@ -173,7 +173,11 @@ The copier runs at nice 19 and in the idle I/O class either way.
 The threads that serve the mount do not.
 A cap below the container's write rate makes
 .I queue_depth
-rise. The backlog stays in the local queue directory.
+rise. That count is queued operations plus dirty files.
+The backlog stays in the local queue directory.
+.I <mount>/sys/drop
+removes one sequence number shown by
+.IR <mount>/sys/queue .
 .TP
 .B allow_other
 Let every user access the filesystem.

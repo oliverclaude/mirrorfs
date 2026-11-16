@@ -1,10 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use crate::dirty::Dirty;
 
 use crate::util::{self, QUEUE_DIR_NAME};
 
@@ -25,6 +27,7 @@ const KIND_FSYNC: u32 = 11;
 const KIND_FALLOCATE: u32 = 12;
 const KIND_COPY: u32 = 13;
 const KIND_COPY_BLOB: u32 = 14;
+const KIND_COPY_LIVE: u32 = 15;
 
 /// File contents at or below this size stay inside the queue record.
 /// Anything larger is streamed into a sparse blob outside the queue lock.
@@ -99,6 +102,12 @@ pub enum Op {
     /// Legacy write whose payload exceeds [`INLINE_LIMIT`].
     #[allow(dead_code)]
     WriteStored(WriteStored),
+    /// Copy the live local object when the copier reaches this record.
+    /// Regular files are not snapshotted into the queue: the bytes stay in
+    /// the local file, including writes that arrived after this record.
+    CopyLive {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +230,10 @@ struct State {
     /// `base` plus the effect of every record still queued. Updated when a
     /// record is appended, so a later mutation does not read record bodies.
     effective: HashSet<PathBuf>,
+    /// Journal paths that must be applied before a dirty bitmap of that path.
+    /// A live copy does not block: later writes fold into the bitmap.
+    blocked: HashMap<PathBuf, u32>,
+    dirty: HashMap<PathBuf, Dirty>,
 }
 
 /// Persistent FIFO stored in `<local>/.mirrorfs-queue/`.
@@ -243,32 +256,51 @@ impl Queue {
             let entry = entry?;
             let name = entry.file_name();
             let text = name.to_string_lossy();
-            if text.ends_with(".op.tmp") || text.ends_with(".blob.tmp") {
+            if text.ends_with(".op.tmp")
+                || text.ends_with(".blob.tmp")
+                || text.ends_with(".dirty.tmp")
+            {
                 let _ = fs::remove_file(entry.path());
             }
         }
         let mut seqs = pending_seqs(&dir)?;
         seqs.sort_unstable();
-        let next = seqs.last().copied().unwrap_or(0) + 1;
         let base = load_base(&dir.join("base.log"))?;
         let mut effective = base.clone();
         let mut blobs = HashSet::new();
-        for seq in seqs {
-            let op = load_op(&dir, seq)?;
+        let mut blocked = HashMap::new();
+        for seq in &seqs {
+            let op = load_op(&dir, *seq)?;
             if let Op::CopyBlob(op) = &op {
                 if let Some(name) = op.blob.file_name() {
                     blobs.insert(PathBuf::from(name));
                 }
             }
+            note_block(&mut blocked, &op, 1);
             note_effect(&mut effective, &op);
         }
         reap_unreferenced_blobs(&dir, &blobs)?;
+        let mut dirty = HashMap::new();
+        let mut dirty_seqs = crate::dirty::list_seqs(&dir)?;
+        dirty_seqs.sort_unstable();
+        for seq in &dirty_seqs {
+            let loaded = Dirty::load(&dir.join(format!("{seq:020}.dirty")))?;
+            dirty.insert(loaded.path.clone(), loaded);
+        }
+        let next = seqs
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .max(dirty_seqs.last().copied().unwrap_or(0))
+            + 1;
         Ok(Self {
             dir,
             inner: Mutex::new(State {
                 next,
                 base,
                 effective,
+                blocked,
+                dirty,
             }),
         })
     }
@@ -287,15 +319,17 @@ impl Queue {
         write_op(&dir, &mut state, op)
     }
 
-    /// Queue `op`. A write or metadata change for a path the remote does not
-    /// yet have is preceded by a copy of the local object.
-    ///
-    /// Files of [`INLINE_LIMIT`] bytes or less are stored in the record.
-    /// Larger files are streamed into a sparse blob before the queue lock is
-    /// taken. A rename whose source tree is already on the remote is replayed
-    /// as a rename. Otherwise the post-rename object is copied and the rename
+    /// Queue `op`. A mutation of a regular file the remote already has is
+    /// folded into that file's dirty bitmap. A regular file the remote has
+    /// never had is one live copy of the local file, not a second stored
+    /// copy of its bytes. Directories, symlinks, and devices stay inline.
+    /// A rename whose source tree is already on the remote is replayed as a
+    /// rename. Otherwise the post-rename object is copied and the rename
     /// itself is not queued, because the remote has nothing to move.
     pub fn push_for_remote(&self, local_root: &Path, op: &Op) -> io::Result<u64> {
+        if let Some(seq) = self.fold_dirty(local_root, op)? {
+            return Ok(seq);
+        }
         loop {
             let plan = {
                 let state = self.inner.lock().expect("queue lock");
@@ -325,6 +359,8 @@ impl Queue {
             write_base_file(&dir, &base)?;
             state.base = base;
         }
+        relocate_dirty(&dir, &mut state, op)?;
+        note_block(&mut state.blocked, op, -1);
         remove_record(&dir, seq)?;
         if let Op::CopyBlob(op) = op {
             match fs::remove_file(&op.blob) {
@@ -336,10 +372,138 @@ impl Queue {
         Ok(())
     }
 
+    /// Remove one journal record or one dirty file.
+    ///
+    /// `seq` is the number at the start of a `sys/queue` line. The record is
+    /// not applied and is not written into `base.log`. `Ok(false)` means that
+    /// number is not in the queue.
+    pub fn drop_seq(&self, seq: u64) -> io::Result<bool> {
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        if let Some(path) = state
+            .dirty
+            .iter()
+            .find(|(_, dirty)| dirty.seq == seq)
+            .map(|(path, _)| path.clone())
+        {
+            state.dirty.remove(&path);
+            crate::dirty::remove(&dir, seq)?;
+            return Ok(true);
+        }
+        let record = dir.join(format!("{seq:020}.op"));
+        if !record.exists() {
+            return Ok(false);
+        }
+        let op = load_op(&dir, seq)?;
+        if let Op::CopyBlob(op) = &op {
+            match fs::remove_file(&op.blob) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        note_block(&mut state.blocked, &op, -1);
+        remove_record(&dir, seq)?;
+        rebuild_effective(&dir, &mut state)?;
+        Ok(true)
+    }
+
+    /// Lines for `sys/queue`. Record bodies are not loaded: a write payload
+    /// is counted and skipped.
+    pub fn listing(&self) -> io::Result<Vec<u8>> {
+        let mut lines: Vec<(u64, String)> = Vec::new();
+        for seq in pending_seqs(&self.dir)? {
+            lines.push((seq, summarize_op(&self.dir, seq)?));
+        }
+        let state = self.inner.lock().expect("queue lock");
+        for dirty in state.dirty.values() {
+            lines.push((dirty.seq, dirty.describe()));
+        }
+        drop(state);
+        lines.sort_by_key(|(seq, _)| *seq);
+        let mut out = String::new();
+        for (seq, text) in lines {
+            out.push_str(&format!("{seq} {text}\n"));
+        }
+        Ok(out.into_bytes())
+    }
+
+    /// The oldest dirty file whose path is not waiting on a journal record.
+    pub fn next_dirty(&self) -> Option<crate::dirty::Job> {
+        let state = self.inner.lock().expect("queue lock");
+        state
+            .dirty
+            .values()
+            .filter(|dirty| !path_blocked(&state.blocked, &dirty.path))
+            .min_by_key(|dirty| dirty.seq)
+            .map(Dirty::job)
+    }
+
+    /// Forget a dirty file when the copier finished the generation it read.
+    /// A write that arrived during the copy bumped the generation, so those
+    /// blocks stay dirty. Returns whether the file was removed.
+    pub fn ack_dirty(&self, seq: u64, generation: u64) -> io::Result<bool> {
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        let Some(path) = state
+            .dirty
+            .iter()
+            .find(|(_, dirty)| dirty.seq == seq)
+            .map(|(path, _)| path.clone())
+        else {
+            return Ok(false);
+        };
+        let generation_now = state.dirty.get(&path).map(|dirty| dirty.generation);
+        if generation_now != Some(generation) {
+            return Ok(false);
+        }
+        state.dirty.remove(&path);
+        crate::dirty::remove(&dir, seq)?;
+        Ok(true)
+    }
+
+    fn fold_dirty(&self, local_root: &Path, op: &Op) -> io::Result<Option<u64>> {
+        if !folds_into_dirty(op) {
+            return Ok(None);
+        }
+        let path = op.path();
+        let full = local_root.join(path);
+        let st = match util::lstat(&full) {
+            Ok(st) => st,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Ok(None);
+        }
+        let dir = self.dir.clone();
+        let mut state = self.inner.lock().expect("queue lock");
+        if path_blocked(&state.blocked, path) {
+            return Ok(None);
+        }
+        if state.effective.contains(path) {
+            return Ok(Some(merge_dirty(&dir, &mut state, op)?));
+        }
+        if !wants_snapshot(op) {
+            return Ok(None);
+        }
+        // The remote has never had this file. One live copy reads the local
+        // file when the copier runs, so the queue does not store another copy
+        // of a disk image. A later write folds into the bitmap.
+        let live = Op::CopyLive {
+            path: path.to_path_buf(),
+        };
+        let seq = write_op(&dir, &mut state, &live)?;
+        if matches!(op, Op::Fallocate { .. }) {
+            merge_dirty(&dir, &mut state, op)?;
+        }
+        Ok(Some(seq))
+    }
+
     /// Number of committed records. Does not read them.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn depth(&self) -> io::Result<usize> {
-        Ok(pending_seqs(&self.dir)?.len())
+        Ok(pending_seqs(&self.dir)?.len() + crate::dirty::list_seqs(&self.dir)?.len())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -401,8 +565,48 @@ fn write_op(dir: &Path, state: &mut State, op: &Op) -> io::Result<u64> {
     fs::rename(&tmp, &final_path)?;
     fsync_dir(dir)?;
     state.next = seq + 1;
+    note_block(&mut state.blocked, op, 1);
     note_effect(&mut state.effective, op);
     Ok(seq)
+}
+
+fn folds_into_dirty(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Write(_)
+            | Op::Setattr(_)
+            | Op::Fsync { .. }
+            | Op::Setxattr { .. }
+            | Op::Removexattr { .. }
+            | Op::Fallocate { .. }
+    )
+}
+
+fn note_block(blocked: &mut HashMap<PathBuf, u32>, op: &Op, delta: i32) {
+    for path in blocking_paths(op) {
+        let entry = blocked.entry(path).or_insert(0);
+        if delta < 0 {
+            *entry = entry.saturating_sub(delta.unsigned_abs());
+        } else {
+            *entry = entry.saturating_add(delta as u32);
+        }
+    }
+    blocked.retain(|_, count| *count > 0);
+}
+
+fn blocking_paths(op: &Op) -> Vec<PathBuf> {
+    match op {
+        Op::Copy(_) | Op::CopyBlob(_) | Op::CopyStored(_) | Op::CopyLive { .. } => Vec::new(),
+        Op::Rename { from, to, .. } => vec![from.clone(), to.clone()],
+        Op::Link { from, to } => vec![from.clone(), to.clone()],
+        other => vec![other.path().to_path_buf()],
+    }
+}
+
+fn path_blocked(blocked: &HashMap<PathBuf, u32>, path: &Path) -> bool {
+    blocked
+        .iter()
+        .any(|(have, count)| *count > 0 && (path == have || path.starts_with(have)))
 }
 
 fn remove_record(dir: &Path, seq: u64) -> io::Result<()> {
@@ -413,6 +617,136 @@ fn remove_record(dir: &Path, seq: u64) -> io::Result<()> {
         Err(err) => return Err(err),
     }
     fsync_dir(dir)
+}
+
+fn merge_dirty(dir: &Path, state: &mut State, op: &Op) -> io::Result<u64> {
+    let path = op.path().to_path_buf();
+    let mut dirty = match state.dirty.remove(&path) {
+        Some(dirty) => dirty,
+        None => {
+            let seq = state.next;
+            state.next = state.next.saturating_add(1);
+            Dirty::new(seq, path.clone())
+        }
+    };
+    dirty.mark_op(op);
+    crate::dirty::store(dir, &dirty)?;
+    let seq = dirty.seq;
+    state.dirty.insert(path, dirty);
+    Ok(seq)
+}
+
+fn relocate_dirty(dir: &Path, state: &mut State, op: &Op) -> io::Result<()> {
+    let Op::Rename { from, to, flags } = op else {
+        return Ok(());
+    };
+    let exchange = flags & libc::RENAME_EXCHANGE != 0;
+    let paths: Vec<PathBuf> = state.dirty.keys().cloned().collect();
+    for path in paths {
+        let moved = util::relocated_path(&path, from, to).or_else(|| {
+            if exchange {
+                util::relocated_path(&path, to, from)
+            } else {
+                None
+            }
+        });
+        let Some(moved) = moved else {
+            continue;
+        };
+        if moved == path {
+            continue;
+        }
+        let Some(mut dirty) = state.dirty.remove(&path) else {
+            continue;
+        };
+        dirty.path = moved.clone();
+        crate::dirty::store(dir, &dirty)?;
+        state.dirty.insert(moved, dirty);
+    }
+    Ok(())
+}
+
+fn rebuild_effective(dir: &Path, state: &mut State) -> io::Result<()> {
+    let mut seqs = pending_seqs(dir)?;
+    seqs.sort_unstable();
+    let mut effective = state.base.clone();
+    let mut blocked = HashMap::new();
+    for seq in seqs {
+        let op = load_op(dir, seq)?;
+        note_block(&mut blocked, &op, 1);
+        note_effect(&mut effective, &op);
+    }
+    state.effective = effective;
+    state.blocked = blocked;
+    Ok(())
+}
+
+fn summarize_op(dir: &Path, seq: u64) -> io::Result<String> {
+    let path = dir.join(format!("{seq:020}.op"));
+    let mut file = File::open(&path)?;
+    let len = file.metadata()?.len();
+    if len <= 64 * 1024 {
+        let op = load_op(dir, seq)?;
+        return Ok(op.describe());
+    }
+    summarize_large(&mut file)
+}
+
+fn summarize_large(file: &mut File) -> io::Result<String> {
+    let magic = read_exact(file, 4)?;
+    if magic.as_slice() != MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad queue magic",
+        ));
+    }
+    let _version = read_u32(file)?;
+    let kind = read_u32(file)?;
+    let text = match kind {
+        KIND_WRITE => {
+            let path = read_path(file)?;
+            let offset = read_u64(file)?;
+            let len = read_u64(file)?;
+            format!("write {} offset={offset} bytes={len}", path.display())
+        }
+        KIND_COPY => {
+            let path = read_path(file)?;
+            format!("copy {} stored", path.display())
+        }
+        KIND_COPY_BLOB => {
+            let path = read_path(file)?;
+            format!("copy {} blob", path.display())
+        }
+        _ => {
+            file.seek(SeekFrom::Start(0))?;
+            // The record is large but not a write or copy payload. Read the
+            // header only up to the slurp limit's caller; describe what we can.
+            format!("op kind={kind}")
+        }
+    };
+    Ok(text)
+}
+
+fn read_exact(file: &mut File, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_u32(file: &mut File) -> io::Result<u32> {
+    let buf = read_exact(file, 4)?;
+    Ok(u32::from_le_bytes(buf.try_into().unwrap()))
+}
+
+fn read_u64(file: &mut File) -> io::Result<u64> {
+    let buf = read_exact(file, 8)?;
+    Ok(u64::from_le_bytes(buf.try_into().unwrap()))
+}
+
+fn read_path(file: &mut File) -> io::Result<PathBuf> {
+    let len = read_u64(file)? as usize;
+    let buf = read_exact(file, len)?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
 }
 
 fn wants_snapshot(op: &Op) -> bool {
@@ -433,6 +767,7 @@ fn note_effect(base: &mut HashSet<PathBuf>, op: &Op) -> bool {
         Op::Copy(op) => base.insert(op.path.clone()),
         Op::CopyBlob(op) => base.insert(op.path.clone()),
         Op::CopyStored(op) => base.insert(op.snap.path.clone()),
+        Op::CopyLive { path } => base.insert(path.clone()),
         Op::Unlink(path) | Op::Rmdir(path) => base.remove(path),
         Op::Link { to, .. } => base.insert(to.clone()),
         Op::Symlink { path, .. } => base.insert(path.clone()),
@@ -538,37 +873,18 @@ fn plan_copies(effective: &HashSet<PathBuf>, op: &Op) -> Plan {
 
 struct Prepared {
     captured: Captured,
-    committed: bool,
 }
 
 enum Captured {
     Inline(Snapshot),
-    Blob {
-        meta: Snapshot,
-        tmp: PathBuf,
-        logical_size: u64,
-    },
-}
-
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if let Captured::Blob { tmp, .. } = &self.captured {
-            let _ = fs::remove_file(tmp);
-        }
-    }
+    Live(PathBuf),
 }
 
 fn prepare_copies(local_root: &Path, queue_dir: &Path, plan: &Plan) -> io::Result<Vec<Prepared>> {
     let mut out = Vec::new();
     for path in &plan.copies {
         match capture(local_root, queue_dir, path) {
-            Ok(captured) => out.push(Prepared {
-                captured,
-                committed: false,
-            }),
+            Ok(captured) => out.push(Prepared { captured }),
             Err(err) => {
                 drop(out);
                 return Err(err);
@@ -578,32 +894,17 @@ fn prepare_copies(local_root: &Path, queue_dir: &Path, plan: &Plan) -> io::Resul
     Ok(out)
 }
 
-fn capture(local_root: &Path, queue_dir: &Path, rel: &Path) -> io::Result<Captured> {
+fn capture(local_root: &Path, _queue_dir: &Path, rel: &Path) -> io::Result<Captured> {
     let full = local_root.join(rel);
     let st = util::lstat(&full)?;
     let kind = kind_of_mode(st.st_mode);
-    if kind == ObjectKind::File && st.st_size as u64 > INLINE_LIMIT {
-        let tmp = blob_tmp(queue_dir);
-        if let Err(err) = crate::sparse::copy_sparse(&full, &tmp) {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
-        let meta = snapshot_meta(&full, rel)?;
-        let logical_size = util::lstat(&full)?.st_size as u64;
-        return Ok(Captured::Blob {
-            meta,
-            tmp,
-            logical_size,
-        });
+    // A regular file is copied from the live local file when the record
+    // runs. Storing an 8 GiB snapshot here would fill the queue disk while
+    // the remote is down, and the next write would do it again.
+    if kind == ObjectKind::File {
+        return Ok(Captured::Live(rel.to_path_buf()));
     }
     Ok(Captured::Inline(snapshot(local_root, rel)?))
-}
-
-fn blob_tmp(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".{}.{n}.blob.tmp", std::process::id()))
 }
 
 fn commit_plan(
@@ -611,10 +912,10 @@ fn commit_plan(
     state: &mut State,
     op: &Op,
     plan: &Plan,
-    mut prepared: Vec<Prepared>,
+    prepared: Vec<Prepared>,
 ) -> io::Result<u64> {
     let mut seq = state.next.saturating_sub(1);
-    for item in &mut prepared {
+    for item in &prepared {
         seq = commit_one(dir, state, item)?;
     }
     if plan.queue_op {
@@ -623,42 +924,11 @@ fn commit_plan(
     Ok(seq)
 }
 
-fn commit_one(dir: &Path, state: &mut State, item: &mut Prepared) -> io::Result<u64> {
-    let seq = match &item.captured {
-        Captured::Inline(snap) => write_op(dir, state, &Op::Copy(snap.clone()))?,
-        Captured::Blob {
-            meta,
-            tmp,
-            logical_size,
-        } => {
-            let seq = state.next;
-            let name = format!("{seq:020}.blob");
-            let dest = dir.join(&name);
-            fs::rename(tmp, &dest)?;
-            let op = Op::CopyBlob(CopyBlob {
-                path: meta.path.clone(),
-                kind: meta.kind,
-                mode: meta.mode,
-                uid: meta.uid,
-                gid: meta.gid,
-                rdev: meta.rdev,
-                atime: meta.atime,
-                mtime: meta.mtime,
-                xattrs: meta.xattrs.clone(),
-                logical_size: *logical_size,
-                blob: PathBuf::from(name),
-            });
-            match write_op(dir, state, &op) {
-                Ok(seq) => seq,
-                Err(err) => {
-                    let _ = fs::remove_file(&dest);
-                    return Err(err);
-                }
-            }
-        }
-    };
-    item.committed = true;
-    Ok(seq)
+fn commit_one(dir: &Path, state: &mut State, item: &Prepared) -> io::Result<u64> {
+    match &item.captured {
+        Captured::Inline(snap) => write_op(dir, state, &Op::Copy(snap.clone())),
+        Captured::Live(path) => write_op(dir, state, &Op::CopyLive { path: path.clone() }),
+    }
 }
 
 fn reap_unreferenced_blobs(dir: &Path, referenced: &HashSet<PathBuf>) -> io::Result<()> {
@@ -893,6 +1163,7 @@ impl Op {
             Op::CopyBlob(op) => &op.path,
             Op::CopyStored(op) => &op.snap.path,
             Op::WriteStored(op) => &op.path,
+            Op::CopyLive { path } => path,
         }
     }
 
@@ -933,6 +1204,7 @@ impl Op {
             Op::CopyBlob(op) => {
                 format!("copy {} bytes={}", op.path.display(), op.logical_size)
             }
+            Op::CopyLive { path } => format!("copy {} live", path.display()),
             Op::CopyStored(op) => format!("copy {} bytes={}", op.snap.path.display(), op.len),
             Op::WriteStored(op) => format!(
                 "write {} offset={} bytes={}",
@@ -958,7 +1230,7 @@ impl Op {
             Op::Removexattr { .. } => "removexattr",
             Op::Fsync { .. } => "fsync",
             Op::Fallocate { .. } => "fallocate",
-            Op::Copy(_) | Op::CopyBlob(_) | Op::CopyStored(_) => "copy",
+            Op::Copy(_) | Op::CopyBlob(_) | Op::CopyStored(_) | Op::CopyLive { .. } => "copy",
             Op::WriteStored(_) => "write",
         }
     }
@@ -1135,6 +1407,10 @@ impl Op {
             Op::CopyStored(_) | Op::WriteStored(_) => {
                 // These exist only as a view of a record already on disk.
             }
+            Op::CopyLive { path } => {
+                put_u32(&mut out, KIND_COPY_LIVE);
+                put_path(&mut out, path);
+            }
         }
         out
     }
@@ -1302,6 +1578,7 @@ impl Op {
                     blob: cur.path()?,
                 })
             }
+            KIND_COPY_LIVE => Op::CopyLive { path: cur.path()? },
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1579,7 +1856,7 @@ fn put_path(out: &mut Vec<u8>, path: &Path) {
 mod tests {
     use super::*;
     use std::fs::{File, OpenOptions};
-    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::os::unix::fs::FileExt;
 
     fn sample_ops() -> Vec<Op> {
         vec![
@@ -1722,17 +1999,12 @@ mod tests {
         fs::write(&file, b"original\nmore\n").unwrap();
         queue.push_for_remote(&root, &write).unwrap();
         let pending = queue.pending().unwrap();
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         match &pending[0].1 {
-            Op::Copy(snap) => {
-                assert_eq!(snap.data, b"original\nmore\n");
-                assert_eq!(snap.path, PathBuf::from("pre/exist.txt"));
-                assert_eq!(snap.kind, ObjectKind::File);
-            }
-            other => panic!("expected copy, got {other:?}"),
+            Op::CopyLive { path } => assert_eq!(path, &PathBuf::from("pre/exist.txt")),
+            other => panic!("expected live copy, got {other:?}"),
         }
-        assert_eq!(pending[1].1, write);
-        queue
+        let seq = queue
             .push_for_remote(
                 &root,
                 &Op::Write(WriteData {
@@ -1743,8 +2015,12 @@ mod tests {
             )
             .unwrap();
         let pending = queue.pending().unwrap();
-        assert_eq!(pending.len(), 3);
-        assert!(matches!(pending[2].1, Op::Write(_)));
+        assert_eq!(pending.len(), 1, "later writes fold into the dirty bitmap");
+        let listed = String::from_utf8(queue.listing().unwrap()).unwrap();
+        assert!(listed.contains(&format!("{seq} dirty pre/exist.txt")));
+        assert!(queue.drop_seq(seq).unwrap());
+        let listed = String::from_utf8(queue.listing().unwrap()).unwrap();
+        assert!(!listed.contains("dirty pre/exist.txt"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1802,8 +2078,9 @@ mod tests {
             )
             .unwrap();
         let pending = queue.pending().unwrap();
-        assert_eq!(pending.len(), 1, "{pending:?}");
-        assert!(matches!(pending[0].1, Op::Write(_)));
+        assert!(pending.is_empty(), "{pending:?}");
+        let listed = String::from_utf8(queue.listing().unwrap()).unwrap();
+        assert!(listed.contains("dirty other/a"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1833,21 +2110,16 @@ mod tests {
         let pending = queue.pending().unwrap();
         assert_eq!(pending.len(), 1);
         match &pending[0].1 {
-            Op::Copy(snap) => {
-                assert_eq!(snap.path, PathBuf::from("new.txt"));
-                assert_eq!(snap.data, b"moved");
-            }
-            other => panic!("expected copy, got {other:?}"),
+            Op::CopyLive { path } => assert_eq!(path, &PathBuf::from("new.txt")),
+            other => panic!("expected live copy, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn eight_mib_stays_inline_and_one_extra_byte_streams() {
+    fn a_large_file_is_a_live_copy_and_not_a_blob() {
         let root = scratch("bound");
-        let small = root.join("small");
         let big = root.join("big");
-        fs::write(&small, vec![7u8; INLINE_LIMIT as usize]).unwrap();
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -1864,50 +2136,23 @@ mod tests {
             .push_for_remote(
                 &root,
                 &Op::Fsync {
-                    path: PathBuf::from("small"),
-                    datasync: false,
-                },
-            )
-            .unwrap();
-        match &queue.pending().unwrap()[0].1 {
-            Op::Copy(snap) => assert_eq!(snap.data.len() as u64, INLINE_LIMIT),
-            other => panic!("expected inline copy, got {other:?}"),
-        }
-        queue
-            .push_for_remote(
-                &root,
-                &Op::Fsync {
                     path: PathBuf::from("big"),
                     datasync: false,
                 },
             )
             .unwrap();
         let pending = queue.pending().unwrap();
-        let blob = match &pending.iter().find(|(_, op)| matches!(op, Op::CopyBlob(_))) {
-            Some((_, Op::CopyBlob(op))) => op.clone(),
-            other => panic!("expected blob copy, got {other:?}"),
-        };
-        assert_eq!(blob.logical_size, big_len);
-        assert!(blob.blob.is_absolute());
-        let op_path = queue.dir().join(format!("{:020}.op", pending[1].0));
-        // The small copy is record 1 and may be large. The blob record is the
-        // second copy, followed by the fsync. Find the small blob record.
-        let blob_op = pending
-            .iter()
-            .find(|(_, op)| matches!(op, Op::CopyBlob(_)))
-            .unwrap()
-            .0;
-        let op_len = fs::metadata(queue.dir().join(format!("{blob_op:020}.op")))
+        assert!(matches!(pending[0].1, Op::CopyLive { .. }));
+        let op_len = fs::metadata(queue.dir().join(format!("{:020}.op", pending[0].0)))
             .unwrap()
             .len();
-        assert!(op_len < 4096, "blob record is {op_len} bytes");
-        let allocated = fs::metadata(&blob.blob).unwrap().blocks() * 512;
-        let logical = fs::metadata(&blob.blob).unwrap().len();
-        assert_eq!(logical, big_len);
-        if fs::metadata(&big).unwrap().blocks() * 512 * 2 < big_len {
-            assert!(allocated * 2 < big_len, "blob allocated {allocated}");
-        }
-        let _ = op_path;
+        assert!(op_len < 4096, "live copy record is {op_len} bytes");
+        let blobs: Vec<_> = fs::read_dir(queue.dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".blob"))
+            .collect();
+        assert!(blobs.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1926,6 +2171,9 @@ mod tests {
         file.set_len(len).unwrap();
         file.write_at(b"TAIL", len - 4).unwrap();
         drop(file);
+        let live = File::options().write(true).open(&big).unwrap();
+        live.write_at(b"Z", 1).unwrap();
+        drop(live);
         let queue = Queue::open(&root).unwrap();
         queue
             .push_for_remote(
@@ -1950,15 +2198,16 @@ mod tests {
             )
             .unwrap();
         let pending = queue.pending().unwrap();
-        assert_eq!(pending.len(), 3, "{pending:?}");
-        assert!(matches!(pending[0].1, Op::CopyBlob(_)));
-        assert!(matches!(pending[1].1, Op::Write(_)));
-        assert!(matches!(pending[2].1, Op::Write(_)));
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(matches!(pending[0].1, Op::CopyLive { .. }));
+        let job = queue.next_dirty().expect("second write is dirty");
         fs::create_dir_all(&remote).unwrap();
         for (seq, op) in &pending {
             crate::worker::apply(&root, &remote, op).unwrap();
             queue.finish(*seq, op).unwrap();
         }
+        crate::worker::apply_dirty(&root, &remote, &job).unwrap();
+        assert!(queue.ack_dirty(job.seq, job.generation).unwrap());
         let copied = remote.join("disk.raw");
         let out = File::open(&copied).unwrap();
         assert_eq!(out.metadata().unwrap().len(), len);
